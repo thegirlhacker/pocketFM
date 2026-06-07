@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.vscode/
+samples/issue_123_fix/agent_trace.log
