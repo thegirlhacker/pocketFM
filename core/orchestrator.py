@@ -1,5 +1,6 @@
 import json
 import re
+import os
 import logging
 from openai import OpenAI
 from rich.console import Console
@@ -58,6 +59,22 @@ class AgentOrchestrator:
         self.tool_registry.register("grep", grep)
         self.tool_registry.register("tree", tree)
         self.tool_registry.register("read_file", read_file)
+
+    def _get_repo_agents_context(self) -> str:
+        """Looks for AGENTS.md or .github/AGENTS.md to inject project-specific rules."""
+        candidate_paths = [
+            os.path.join(self.repo_path, "AGENTS.md"),
+            os.path.join(self.repo_path, ".github", "AGENTS.md"),
+            os.path.join(self.repo_path, "RULES.md")
+        ]
+        for path in candidate_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        return f"\n\n--- REPOSITORY SPECIFIC RULES ({os.path.basename(path)}) ---\n{f.read().strip()}\n-----------------------------------\n"
+                except Exception as e:
+                    logger.warning(f"Failed to read {path}: {e}")
+        return ""
 
     def _inject_tools_into_prompt(self, prompt: str) -> str:
         """Dynamically injects available tool descriptions into the system prompt."""
@@ -167,10 +184,14 @@ class AgentOrchestrator:
         if len(ranked_context) > 15000:
             ranked_context = ranked_context[:15000] + "\n...[TRUNCATED: File too large. Use read_file with start_line and end_line to read the rest.]"
 
+        agents_context = self._get_repo_agents_context()
+
         # STAGE 1: PLANNER
         console.print("\n[bold cyan]🧠 STAGE 1: PLANNER IS INVESTIGATING...[/bold cyan]")
         
         dynamic_planner_prompt = self._inject_tools_into_prompt(self.planner_sys_prompt)
+        if agents_context:
+            dynamic_planner_prompt += agents_context
         
         planner_messages = [
             {"role": "system", "content": dynamic_planner_prompt},
@@ -195,6 +216,8 @@ class AgentOrchestrator:
 
         # STAGES 2 & 3: CODER + VALIDATION LOOP
         dynamic_coder_prompt = self._inject_tools_into_prompt(self.coder_sys_prompt)
+        if agents_context:
+            dynamic_coder_prompt += agents_context
         
         coder_messages = [
             {"role": "system", "content": dynamic_coder_prompt},
