@@ -1,7 +1,9 @@
 import json
 import re
 import os
+import time
 import logging
+import openai
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
@@ -9,7 +11,7 @@ from rich.markdown import Markdown
 
 from tools.search.grep_tool import grep_search
 from tools.search.tree_mapper import get_repo_structure
-from tools.editor.diff_applier import format_terminal_edits, apply_git_diff, revert_repo, extract_modified_files
+from tools.editor.diff_applier import format_terminal_edits, apply_git_diff, revert_repo, extract_modified_files, _extract_unified_diff
 from tools.editor.file_reader import (
     format_ranked_files,
     rank_relevant_files,
@@ -113,6 +115,37 @@ class AgentOrchestrator:
                 return match.group(1), {}
         return None, None
 
+    def _handle_rate_limit(self, e: Exception):
+        msg = f"[bold red]API Rate Limit Exceeded[/bold red]\n\n"
+        msg += "The system hit the request limit for your current API key provider.\n"
+        msg += f"[dim]Details: {e}[/dim]\n\n"
+        msg += "If you are using the free GitHub Models API, there is a strict limit of 50 requests per day. "
+        msg += "To continue testing, please supply a standard OpenAI API key in your `.env` file or wait for the limit to reset."
+        console.print(Panel(msg, border_style="red"))
+
+    def _animate_diff(self, final_fix: str):
+        """Creates a beautiful typing effect for code changes in red and green."""
+        console.print("\n[bold cyan]✨ APPLYING CHANGES...[/bold cyan]")
+        time.sleep(1) # Dramatic pause
+
+        diff_text = _extract_unified_diff(final_fix)
+        if not diff_text:
+            diff_text = final_fix
+
+        for line in diff_text.splitlines():
+            if line.startswith("-") and not line.startswith("---"):
+                console.print(f"[bold red]{line}[/bold red]")
+                time.sleep(0.08)  # Typing delay for removed code
+            elif line.startswith("+") and not line.startswith("+++"):
+                console.print(f"[bold green]{line}[/bold green]")
+                time.sleep(0.08)  # Typing delay for added code
+            else:
+                console.print(f"[dim]{line}[/dim]")
+                time.sleep(0.02)  # Fast scroll for unchanged context
+        
+        console.print("\n[bold green]✅ Code successfully updated![/bold green]")
+        time.sleep(2) # 2-second pause before validation
+
     # --- THE CORE ReAct LOOP (Claude Pattern) ---
     def _run_agent_loop(self, messages: list, max_steps: int, stop_word: str):
         """A generic ReAct loop that works for both Planner and Coder."""
@@ -123,11 +156,18 @@ class AgentOrchestrator:
             if len(messages) > 10:
                 messages = messages[:2] + messages[-8:]
                 
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.2
-            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.2
+                )
+            except openai.RateLimitError as e:
+                self._handle_rate_limit(e)
+                return None
+            except Exception as e:
+                console.print(f"[bold red]❌ Unexpected API Error: {e}[/bold red]")
+                return None
             
             reply = response.choices[0].message.content
             messages.append({"role": "assistant", "content": reply})
@@ -159,6 +199,7 @@ class AgentOrchestrator:
     def _generate_pr_summary(self, issue_description: str, final_fix: str) -> str:
         """Calls the PR Generator LLM to write a PR title and body."""
         console.print("\n[bold cyan]📝 STAGE 4: GENERATING PULL REQUEST SUMMARY...[/bold cyan]")
+        time.sleep(1)
         messages = [
             {"role": "system", "content": self.pr_generator_sys_prompt},
             {
@@ -167,12 +208,19 @@ class AgentOrchestrator:
             }
         ]
         
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.3
-        )
-        return response.choices[0].message.content
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.3
+            )
+            return response.choices[0].message.content
+        except openai.RateLimitError as e:
+            self._handle_rate_limit(e)
+            return "Failed to generate PR summary due to API Rate Limits."
+        except Exception as e:
+            console.print(f"[bold red]❌ Unexpected API Error: {e}[/bold red]")
+            return "Failed to generate PR summary due to an API Error."
 
     # --- THE MASTER FLOW ---
     def run(self, issue_description: str):
@@ -187,6 +235,7 @@ class AgentOrchestrator:
         agents_context = self._get_repo_agents_context()
 
         # STAGE 1: PLANNER
+        time.sleep(1)
         console.print("\n[bold cyan]🧠 STAGE 1: PLANNER IS INVESTIGATING...[/bold cyan]")
         
         dynamic_planner_prompt = self._inject_tools_into_prompt(self.planner_sys_prompt)
@@ -209,10 +258,11 @@ class AgentOrchestrator:
         plan = self._run_agent_loop(planner_messages, max_steps=15, stop_word="PLAN_COMPLETE:")
         
         if not plan:
-            console.print("[bold red]❌ Planner failed to create a plan within step limit.[/bold red]")
+            console.print("[bold red]❌ Planner failed to create a plan within step limit or due to API errors.[/bold red]")
             return
 
         console.print(Panel(Markdown(plan), title="Action Plan", border_style="green"))
+        time.sleep(1.5)
 
         # STAGES 2 & 3: CODER + VALIDATION LOOP
         dynamic_coder_prompt = self._inject_tools_into_prompt(self.coder_sys_prompt)
@@ -242,10 +292,13 @@ class AgentOrchestrator:
             final_fix = self._run_agent_loop(coder_messages, max_steps=8, stop_word="FINAL_FIX:")
             
             if not final_fix:
-                console.print("[bold red]❌ Coder failed to generate a fix within step limit.[/bold red]")
+                console.print("[bold red]❌ Coder failed to generate a fix within step limit or due to API errors.[/bold red]")
                 break
 
-            console.print("\n[bold cyan]🧪 STAGE 3: APPLYING FIX AND RUNNING GO VALIDATOR...[/bold cyan]")
+            # --- ANIMATED DIFF UI ---
+            self._animate_diff(final_fix)
+
+            console.print("\n[bold cyan]🧪 STAGE 3: VALIDATION STARTED...[/bold cyan]")
             
             applied, apply_msg = apply_git_diff(self.repo_path, final_fix)
             if not applied:
@@ -256,6 +309,7 @@ class AgentOrchestrator:
                     "role": "user", 
                     "content": f"Failed to apply git diff. Ensure your diff lines up exactly with the existing source code.\nError:\n{apply_msg}\nPlease try again and provide a corrected FINAL_FIX."
                 })
+                time.sleep(1)
                 continue
                 
             console.print("[green]✅ Diff applied successfully to local repository.[/green]")
@@ -266,6 +320,15 @@ class AgentOrchestrator:
             
             if valid:
                 console.print("[bold green]✅ Validation successful! Code compiles and tests pass.[/bold green]")
+                # Flash final code in green for a few seconds
+                time.sleep(1)
+                console.print("\n[bold green]FINAL VALIDATED CODE INTEGRATED:[/bold green]")
+                # We print it out very fast in full green
+                for line in _extract_unified_diff(final_fix).splitlines():
+                    if line.startswith("+") and not line.startswith("+++"):
+                        console.print(f"[bold green]{line}[/bold green]")
+                time.sleep(3) # Wait 3 seconds
+                
                 final_fix_to_use = final_fix
                 break
             else:
@@ -281,6 +344,7 @@ class AgentOrchestrator:
                 feedback += "Please analyze the error and provide a corrected FINAL_FIX."
                 
                 coder_messages.append({"role": "user", "content": feedback})
+                time.sleep(1)
                 
         if not final_fix_to_use:
             console.print("[bold red]❌ Failed to generate a validated fix after multiple attempts.[/bold red]")
@@ -290,6 +354,5 @@ class AgentOrchestrator:
         pr_summary = self._generate_pr_summary(issue_description, final_fix_to_use)
         
         # Display Final Outputs
-        console.print(format_terminal_edits(final_fix_to_use))
         console.print("\n")
         console.print(Panel(Markdown(pr_summary), title="Pull Request Summary", border_style="magenta"))

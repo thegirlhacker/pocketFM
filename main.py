@@ -128,7 +128,7 @@ def main():
         console.print(f"\n[bold red]❌ A fatal error occurred: {e}[/bold red]")
     finally:
         # STEP 5: THE CLEANUP
-        if local_repo_path and local_repo_was_cloned:
+        if local_repo_path:
             console.print("\n[bold cyan]♻️  STEP 5: INITIATING CLEANUP[/bold cyan]")
             cleanup_repo(local_repo_path)
             

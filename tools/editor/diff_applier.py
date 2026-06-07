@@ -23,13 +23,7 @@ def extract_modified_files(diff_text: str) -> list[str]:
 def apply_git_diff(repo_path: str, final_fix: str) -> tuple[bool, str]:
     """Extracts the diff from the LLM output and applies it to the repository."""
     cleaned_fix = (final_fix or "").strip()
-    print("=== RAW FINAL FIX START ===")
-    print(cleaned_fix)
-    print("=== RAW FINAL FIX END ===")
     unified_diff = _extract_unified_diff(cleaned_fix)
-    print("=== EXTRACTED DIFF START ===")
-    print(unified_diff)
-    print("=== EXTRACTED DIFF END ===")
     
     if not unified_diff:
         return False, "No valid unified diff found in the model's output."
