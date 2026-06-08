@@ -70,9 +70,9 @@ def main():
     console.print(Panel.fit("[bold blue]🤖 AGENTIC PR BUILDER: AUTONOMOUS BUG FIXER[/bold blue]", border_style="blue"))
     
     # Check API Key
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("GROQ_API_KEY")
     if not api_key:
-        console.print("[bold red]❌ API Key is missing! Set OPENAI_API_KEY in your .env file.[/bold red]")
+        console.print("[bold red]❌ API Key is missing! Set GROQ_API_KEY in your .env file.[/bold red]")
         sys.exit(1)
 
     # Get User Inputs
