@@ -108,10 +108,13 @@ def main():
         # Handover to Agent
         console.print("\n[bold cyan]🧠 STEP 4: HANDING OVER TO THE AGENT[/bold cyan]")
         
-        # Smart base_url detection: Use GitHub Models if using a GitHub PAT, otherwise use default OpenAI
+        # Smart base_url detection: Use Groq default if nothing is specified.
         base_url = os.environ.get("OPENAI_BASE_URL")
-        if not base_url and (api_key.startswith("ghp_") or api_key.startswith("github_pat_")):
-            base_url = "https://models.inference.ai.azure.com"
+        if not base_url:
+            if api_key.startswith("ghp_") or api_key.startswith("github_pat_"):
+                base_url = "https://models.inference.ai.azure.com"
+            else:
+                base_url = "https://api.groq.com/openai/v1"
 
         agent = AgentOrchestrator(
             repo_path=local_repo_path, 
