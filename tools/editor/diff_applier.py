@@ -11,12 +11,17 @@ def revert_repo(repo_path: str):
     subprocess.run(["git", "clean", "-fd"], cwd=repo_path, capture_output=True)
 
 
-def extract_modified_files(diff_text: str) -> list[str]:
-    """Parses the diff to find which files are being modified."""
+def extract_modified_files(diff_text: str, repo_path: str = None) -> list[str]:
+    """Parses the diff to find which files are being modified. Fallback to git status if no diff."""
     files = []
     for line in diff_text.splitlines():
         if line.startswith("+++ b/"):
             files.append(line[6:].strip())
+            
+    if not files and repo_path:
+        status = subprocess.run(["git", "diff", "--name-only"], cwd=repo_path, capture_output=True, text=True)
+        files = [f.strip() for f in status.stdout.splitlines() if f.strip()]
+        
     return files
 
 
@@ -26,7 +31,10 @@ def apply_git_diff(repo_path: str, final_fix: str) -> tuple[bool, str]:
     unified_diff = _extract_unified_diff(cleaned_fix)
     
     if not unified_diff:
-        return False, "No valid unified diff found in the model's output."
+        status = subprocess.run(["git", "status", "--porcelain"], cwd=repo_path, capture_output=True, text=True)
+        if status.stdout.strip():
+            return True, "Modifications applied via tools (no diff in final text)."
+        return False, "No valid unified diff found and no files modified via tools."
 
     # Write diff to a temporary file
     fd, temp_path = tempfile.mkstemp(suffix=".diff")
@@ -70,6 +78,8 @@ def format_terminal_edits(final_fix: str | None) -> str:
         body = unified_diff
     else:
         body = _normalize_file_blocks(cleaned_fix)
+        if not body:
+            body = cleaned_fix
 
     return "\n".join(
         [
@@ -112,3 +122,32 @@ def _normalize_file_blocks(text: str) -> str:
         sections.append("```go\n" + block.strip() + "\n```")
 
     return "\n\n".join(sections)
+
+
+def edit_file_tool(repo_path: str, filepath: str, old_snippet: str, new_snippet: str) -> str:
+    """Replaces old_snippet with new_snippet in filepath."""
+    safe_path = os.path.normpath(filepath).lstrip(os.sep)
+    full_path = os.path.abspath(os.path.join(repo_path, safe_path))
+    
+    if not os.path.exists(full_path):
+        return f"Error: File '{filepath}' does not exist."
+        
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        if old_snippet not in content:
+            return "Error: old_snippet not found in file. Ensure exact match including whitespace/indentation."
+            
+        occurrences = content.count(old_snippet)
+        if occurrences > 1:
+            return f"Error: old_snippet found {occurrences} times. Make your old_snippet more specific to uniquely identify the location."
+            
+        new_content = content.replace(old_snippet, new_snippet)
+        
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+            
+        return f"Successfully updated {filepath}."
+    except Exception as exc:
+        return f"Error editing file: {exc}"

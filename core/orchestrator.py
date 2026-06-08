@@ -58,9 +58,28 @@ class AgentOrchestrator:
             """Reads file content with exact line numbers. ALWAYS use start_line and end_line to prevent truncation on large files."""
             return self.read_file_tool(filepath, start_line, end_line)
 
+        def read_function(filepath: str, function_name: str) -> str:
+            """
+            Uses Python to parse a Go file and extracts ONLY the exact function block.
+            Use this to read code before attempting an edit. Do not guess the code.
+            """
+            from tools.editor.file_reader import read_function as read_func_tool
+            return read_func_tool(self.repo_path, filepath, function_name)
+
+        def edit_file(filepath: str, old_snippet: str, new_snippet: str) -> str:
+            """
+            Search-and-Replace Editor Tool. 
+            CRITICAL: 'old_snippet' MUST match the existing code in the file EXACTLY, 
+            including all spaces, tabs, and indentation. Do not omit any characters.
+            """
+            from tools.editor.diff_applier import edit_file_tool
+            return edit_file_tool(self.repo_path, filepath, old_snippet, new_snippet)
+
         self.tool_registry.register("grep", grep)
         self.tool_registry.register("tree", tree)
         self.tool_registry.register("read_file", read_file)
+        self.tool_registry.register("read_function", read_function)
+        self.tool_registry.register("edit_file", edit_file)
 
     def _get_repo_agents_context(self) -> str:
         """Looks for AGENTS.md or .github/AGENTS.md to inject project-specific rules."""

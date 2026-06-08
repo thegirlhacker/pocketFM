@@ -110,7 +110,7 @@ def main():
         
         # Smart base_url detection: Use GitHub Models if using a GitHub PAT, otherwise use default OpenAI
         base_url = os.environ.get("OPENAI_BASE_URL")
-        if not base_url and api_key.startswith("ghp_"):
+        if not base_url and (api_key.startswith("ghp_") or api_key.startswith("github_pat_")):
             base_url = "https://models.inference.ai.azure.com"
 
         agent = AgentOrchestrator(

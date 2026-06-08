@@ -181,3 +181,58 @@ def _find_symbol_hits(file_path: str, keywords: list[str]) -> list[str]:
         return []
 
     return sorted(set(symbol_hits), key=str.lower)
+
+
+def read_function(repo_path: str, filepath: str, function_name: str) -> str:
+    """Uses basic parsing logic to extract a Go function by name."""
+    safe_path = os.path.normpath(filepath).lstrip(os.sep)
+    full_path = os.path.abspath(os.path.join(repo_path, safe_path))
+    repo_root = os.path.abspath(repo_path)
+
+    if not full_path.startswith(repo_root + os.sep) and full_path != repo_root:
+        return f"Error: '{filepath}' escapes the repository."
+    if not full_path.endswith(".go"):
+        return f"Error: '{filepath}' is not a Go source file."
+
+    try:
+        with open(full_path, "r", encoding="utf-8") as source_file:
+            lines = source_file.read().splitlines()
+    except Exception as exc:
+        return f"Error reading file: {exc}"
+
+    # Match standard func Name() or func (r Receiver) Name()
+    func_pattern = re.compile(r"^func\s+(?:(?:\([^)]+\)\s+)?)" + re.escape(function_name) + r"\b\s*\(")
+    
+    start_line_idx = -1
+    for i, line in enumerate(lines):
+        if func_pattern.match(line):
+            start_line_idx = i
+            break
+    
+    if start_line_idx == -1:
+        return f"Error: Function '{function_name}' not found in {filepath}."
+
+    brace_count = 0
+    in_func = False
+    end_line_idx = -1
+    
+    for i in range(start_line_idx, len(lines)):
+        line = lines[i]
+        for char in line:
+            if char == '{':
+                brace_count += 1
+                in_func = True
+            elif char == '}':
+                brace_count -= 1
+        
+        if in_func and brace_count == 0:
+            end_line_idx = i
+            break
+            
+    if end_line_idx == -1:
+        end_line_idx = len(lines) - 1
+
+    extracted_lines = lines[start_line_idx:end_line_idx+1]
+    snippet = "\n".join(extracted_lines)
+    return f"// Extracted from {filepath} (Lines {start_line_idx + 1}-{end_line_idx + 1})\n{snippet}"
+
