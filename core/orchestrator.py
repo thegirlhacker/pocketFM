@@ -26,13 +26,15 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 class AgentOrchestrator:
-    def __init__(self, repo_path: str, api_key: str, base_url: str = None):
+    def __init__(self, repo_path: str, api_key: str, base_url: str = "https://api.groq.com/openai/v1"):
         self.repo_path = repo_path
         if base_url:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
         else:
             self.client = OpenAI(api_key=api_key)
-        self.model = "gpt-4o" 
+        
+        # Using Groq Everywhere Strategy for simplicity and reliability
+        self.model = "llama-3.1-70b-versatile" 
         
         # Loading Prompts
         self.planner_sys_prompt = load_prompt("planner_prompt")
