@@ -141,33 +141,99 @@ class AgentOrchestrator:
     def parse_tool_call(self, text: str):
         """Extracts tool name and arguments from the LLM's response."""
         match = re.search(r'TOOL_CALL:\s*([a-zA-Z_]+)\((.*?)\)', text, re.DOTALL)
-        if match:
-            tool_name = match.group(1)
-            args_str = match.group(2).strip()
+        if not match:
+            return None, None
             
-            # If the LLM omitted the braces but used key-value pairs
-            if not args_str.startswith("{") and ":" in args_str:
-                args_str = "{" + args_str + "}"
+        tool_name = match.group(1)
+        args_str = match.group(2).strip()
+        
+        if not args_str:
+            return tool_name, {}
+
+        # 1. Try JSON / Python Dict parsing
+        cleaned = args_str
+        if cleaned.startswith("{") and cleaned.endswith("}"):
+            cleaned = cleaned[1:-1].strip()
+            
+        try:
+            import ast
+            parsed = ast.literal_eval("{" + cleaned + "}")
+            if isinstance(parsed, dict):
+                return tool_name, parsed
+        except Exception:
+            pass
+
+        try:
+            parsed = json.loads("{" + cleaned + "}")
+            if isinstance(parsed, dict):
+                return tool_name, parsed
+        except Exception:
+            pass
+
+        # 2. Try parsing key-value pairs (using either : or = and matching quoted/unquoted keys/values)
+        args_dict = {}
+        kv_pattern = r'(?:["\']?([a-zA-Z_][a-zA-Z0-9_]*)["\']?)\s*[:=]\s*(?:(["\'])(.*?)\2|([0-9.]+)|(True|False|None|nil))'
+        matches = re.findall(kv_pattern, cleaned)
+        if matches:
+            for m in matches:
+                key = m[0]
+                val_str = m[2] if m[1] else (m[3] if m[3] else m[4])
                 
-            try:
-                import ast
-                return tool_name, ast.literal_eval(args_str)
-            except Exception:
-                try:
-                    return tool_name, json.loads(args_str)
-                except Exception:
-                    # Fallback parsing of keyword arguments: key=value
-                    args_dict = {}
-                    kw_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(["\'])(.*?)\2|([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9]+)'
-                    for m in re.finditer(kw_pattern, args_str):
-                        if m.group(1):
-                            args_dict[m.group(1)] = m.group(3)
-                        elif m.group(4):
-                            args_dict[m.group(4)] = int(m.group(5))
-                    if args_dict:
-                        return tool_name, args_dict
-                    return tool_name, {}
-        return None, None
+                # Convert type if numeric or boolean
+                if m[3]:
+                    if '.' in val_str:
+                        val = float(val_str)
+                    else:
+                        val = int(val_str)
+                elif val_str == "True":
+                    val = True
+                elif val_str == "False":
+                    val = False
+                elif val_str in ("None", "nil"):
+                    val = None
+                else:
+                    val = val_str
+                args_dict[key] = val
+            
+            if args_dict:
+                return tool_name, args_dict
+
+        # 3. Try parsing positional arguments
+        pos_args = []
+        pos_pattern = r'(?:(["\'])(.*?)\1|([0-9.]+)|(True|False|None|nil))'
+        matches = re.findall(pos_pattern, cleaned)
+        for m in matches:
+            val_str = m[1] if m[0] else (m[2] if m[2] else m[3])
+            if m[2]:
+                if '.' in val_str:
+                    val = float(val_str)
+                else:
+                    val = int(val_str)
+            elif val_str == "True":
+                val = True
+            elif val_str == "False":
+                val = False
+            elif val_str in ("None", "nil"):
+                val = None
+            else:
+                val = val_str
+            pos_args.append(val)
+
+        if pos_args:
+            tool_func = self.tool_registry.get_tool(tool_name)
+            if tool_func:
+                import inspect
+                sig = inspect.signature(tool_func)
+                params = list(sig.parameters.keys())
+                args_dict = {}
+                for idx, val in enumerate(pos_args):
+                    if idx < len(params):
+                        args_dict[params[idx]] = val
+                if args_dict:
+                    return tool_name, args_dict
+
+        return tool_name, {}
+
 
     def _safe_api_call(self, messages, temperature=0.2, max_retries=10, initial_delay=5):
         """Wraps the OpenAI API call in an exponential backoff loop to handle 429s automatically."""
