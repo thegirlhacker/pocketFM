@@ -115,7 +115,7 @@ def main():
         if not base_url:
             if os.environ.get("GEMINI_API_KEY") and api_key == os.environ.get("GEMINI_API_KEY"):
                 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-                model = "gemini-1.5-flash"
+                model = "gemini-flash-latest"
             elif api_key.startswith("ghp_") or api_key.startswith("github_pat_"):
                 base_url = "https://models.inference.ai.azure.com"
             elif api_key.startswith("sk-"):
