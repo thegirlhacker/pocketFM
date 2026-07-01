@@ -67,6 +67,12 @@ def cleanup_repo(local_path: str):
 
 # --- 3. MAIN EXECUTION LOGIC ---
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Agentic PR Builder: Autonomous Bug Fixer")
+    parser.add_argument("--repo", help="Target GitHub repository URL")
+    parser.add_argument("--issue", help="Bug report/issue description text")
+    args = parser.parse_args()
+
     console.print(Panel.fit("[bold blue]🤖 AGENTIC PR BUILDER: AUTONOMOUS BUG FIXER[/bold blue]", border_style="blue"))
     
     # Check API Key
@@ -76,21 +82,33 @@ def main():
         sys.exit(1)
 
     # Get User Inputs
-    console.print("\n[bold cyan]🔗 STEP 1: TARGET REPOSITORY[/bold cyan]")
-    repo_url = Prompt.ask("Paste GitHub URL (e.g., https://github.com/spf13/cobra)").strip()
+    repo_url = args.repo
+    if not repo_url:
+        console.print("\n[bold cyan]🔗 STEP 1: TARGET REPOSITORY[/bold cyan]")
+        repo_url = Prompt.ask("Paste GitHub URL (e.g., https://github.com/spf13/cobra)").strip()
+    else:
+        console.print(f"\n[bold cyan]🔗 STEP 1: TARGET REPOSITORY[/bold cyan]\nUsing repo: {repo_url}")
+        
     if not repo_url:
         console.print("[bold red]❌ Repo URL is required. Exiting.[/bold red]")
         sys.exit(1)
         
-    console.print("\n[bold cyan]🐛 STEP 2: ISSUE DESCRIPTION[/bold cyan]")
-    console.print("[dim]Paste the exact issue text (Press Enter twice to finish):[/dim]")
-    issue_lines = []
-    while True:
-        line = input()
-        if line == "":
-            break
-        issue_lines.append(line)
-    issue_description = "\n".join(issue_lines)
+    issue_description = args.issue
+    if not issue_description:
+        console.print("\n[bold cyan]🐛 STEP 2: ISSUE DESCRIPTION[/bold cyan]")
+        console.print("[dim]Paste the exact issue text (Press Enter twice to finish):[/dim]")
+        issue_lines = []
+        while True:
+            try:
+                line = input()
+                if line == "":
+                    break
+                issue_lines.append(line)
+            except EOFError:
+                break
+        issue_description = "\n".join(issue_lines)
+    else:
+        console.print(f"\n[bold cyan]🐛 STEP 2: ISSUE DESCRIPTION[/bold cyan]\nUsing issue: {issue_description}")
     
     if not issue_description.strip():
         console.print("[bold red]❌ Issue description is required. Exiting.[/bold red]")
