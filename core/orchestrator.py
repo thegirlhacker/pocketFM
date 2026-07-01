@@ -301,9 +301,11 @@ class AgentOrchestrator:
         for step in range(1, max_steps + 1):
             
             # Anti 413 Payload Too Large Logic for GitHub Models
-            # We keep system, original prompt, and only the last few messages
-            if len(messages) > 10:
-                messages[:] = messages[:2] + messages[-8:]
+            # We keep system, original prompt, and a larger history limit for larger context models.
+            max_history = 40 if "gemini" in self.model else 10
+            if len(messages) > max_history:
+                messages[:] = messages[:2] + messages[-(max_history - 2):]
+                
                 
             try:
                 response = self._safe_api_call(messages, temperature=0.2)
