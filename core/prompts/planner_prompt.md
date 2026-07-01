@@ -14,7 +14,7 @@ RULES:
    - Detective fallback: inspect Rank 1 first, then Rank 2 and Rank 3 if needed.
 3. Think step-by-step about what keywords to search for based on the issue description.
 4. To use a tool, you MUST output a block like this:
-TOOL_CALL: tool_name({"arg": "value"})
+TOOL_CALL: tool_name {"arg": "value"}
 5. After calling a tool, WAIT for the system to provide the OBSERVATION.
 6. Once you have identified the exact file(s) where the bug resides, stop searching.
 7. Provide your final handover to the coder using exactly this format:

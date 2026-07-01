@@ -140,12 +140,19 @@ class AgentOrchestrator:
 
     def parse_tool_call(self, text: str):
         """Extracts tool name and arguments from the LLM's response."""
+        # Try matching with parentheses first: TOOL_CALL: name(...)
         match = re.search(r'TOOL_CALL:\s*([a-zA-Z_]+)\((.*?)\)', text, re.DOTALL)
-        if not match:
-            return None, None
-            
-        tool_name = match.group(1)
-        args_str = match.group(2).strip()
+        if match:
+            tool_name = match.group(1)
+            args_str = match.group(2).strip()
+        else:
+            # Try matching without parentheses: TOOL_CALL: name: {...} or TOOL_CALL: name {...}
+            match = re.search(r'TOOL_CALL:\s*([a-zA-Z_]+)(?:\s*:\s*|\s+)(\{.*?\})', text, re.DOTALL)
+            if match:
+                tool_name = match.group(1)
+                args_str = match.group(2).strip()
+            else:
+                return None, None
         
         if not args_str:
             return tool_name, {}
@@ -313,6 +320,11 @@ class AgentOrchestrator:
                 return None
             
             reply = response.choices[0].message.content
+            if reply is None:
+                console.print(f"[bold red]⚠️ Received empty/None content from model response.[/bold red]")
+                console.print(f"[dim]Response details: {response}[/dim]")
+                return None
+                
             messages.append({"role": "assistant", "content": reply})
 
             # Check if agent reached its goal (PLAN_COMPLETE or FINAL_FIX)

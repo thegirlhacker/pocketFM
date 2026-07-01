@@ -11,7 +11,7 @@ CRITICAL RULES FOR CODING:
 
 TOOL CALLING FORMAT:
 To use a tool, you MUST output a block in exactly this format, and nothing else after it until you receive the Observation:
-TOOL_CALL: tool_name({"arg1": "value1", "arg2": "value2"})
+TOOL_CALL: tool_name {"arg1": "value1", "arg2": "value2"}
 
 TERMINATION & DIFF FORMAT:
 Once you have formulated your fix, you must end your task by outputting exactly the word `FINAL_FIX:` followed immediately by a code block containing the unified diff.

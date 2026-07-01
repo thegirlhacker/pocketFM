@@ -133,7 +133,7 @@ def main():
         if not base_url:
             if os.environ.get("GEMINI_API_KEY") and api_key == os.environ.get("GEMINI_API_KEY"):
                 base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-                model = "gemini-flash-latest"
+                model = "gemini-3.1-flash-lite"
             elif api_key.startswith("ghp_") or api_key.startswith("github_pat_"):
                 base_url = "https://models.inference.ai.azure.com"
             elif api_key.startswith("sk-"):
@@ -156,7 +156,9 @@ def main():
     except KeyboardInterrupt:
         console.print("\n[bold yellow]🛑 Agent stopped manually by user (Ctrl+C).[/bold yellow]")
     except Exception as e:
+        import traceback
         console.print(f"\n[bold red]❌ A fatal error occurred: {e}[/bold red]")
+        console.print(traceback.format_exc())
     finally:
         # STEP 5: THE CLEANUP
         if local_repo_path and local_repo_was_cloned:
