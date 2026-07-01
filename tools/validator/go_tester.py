@@ -9,17 +9,33 @@ from tools.editor.file_reader import read_file_with_line_numbers
 
 def extract_failing_files(output: str) -> set[str]:
     """Extracts filenames from Go compiler or test errors (e.g., utils.go:12:3)."""
-    pattern = r"(?m)^([a-zA-Z0-9_\-\./\\]+\.go):\d+:"
-    return set(re.findall(pattern, output))
+    # Allow leading whitespace (such as tabs or spaces from test failure formatting)
+    pattern = r"(?m)^\s*([a-zA-Z0-9_\-\./\\]+\.go):\d+:"
+    files = re.findall(pattern, output)
+    normalized_files = set()
+    for f in files:
+        normalized_files.add(os.path.normpath(f))
+    return normalized_files
 
 def get_failing_files_context(repo_path: str, files: set[str]) -> str:
     """Reads the contents of the files that broke so the LLM can fix them."""
     context = ""
+    abs_repo_path = os.path.abspath(repo_path)
     for f in files:
-        if not os.path.exists(os.path.join(repo_path, f)):
+        if os.path.isabs(f):
+            f_abs = os.path.abspath(f)
+        else:
+            f_abs = os.path.abspath(os.path.join(abs_repo_path, f))
+            
+        if f_abs.startswith(abs_repo_path + os.sep) or f_abs == abs_repo_path:
+            rel_path = os.path.relpath(f_abs, abs_repo_path)
+        else:
             continue
-        context += f"\n--- {f} ---\n"
-        file_content = read_file_with_line_numbers(repo_path, f)
+            
+        if not os.path.exists(os.path.join(repo_path, rel_path)):
+            continue
+        context += f"\n--- {rel_path} ---\n"
+        file_content = read_file_with_line_numbers(repo_path, rel_path)
         if len(file_content) > 15000:
             file_content = file_content[:15000] + "\n...[TRUNCATED]..."
         context += file_content
@@ -68,6 +84,9 @@ def get_go_binary(repo_path: str) -> str:
         with tarfile.open(tar_path, "r:gz") as tar:
             tar.extractall(path=local_go_dir)
         os.remove(tar_path)
+        # Ensure executable permissions for downloaded go binary
+        if os.path.exists(local_go_bin):
+            os.chmod(local_go_bin, 0o755)
     except Exception as e:
         print(f"Failed to pull Go toolchain: {e}")
         return ""
@@ -89,6 +108,8 @@ def run_go_validation(repo_path: str, modified_files: list[str]) -> tuple[bool, 
     # --- STEP 1: The Quick Syntax Check (Local Test) ---
     target_dirs = set()
     for f in modified_files:
+        if not f.endswith(".go"):
+            continue
         d = os.path.dirname(f)
         target_dirs.add(f"./{d}" if d else ".")
     

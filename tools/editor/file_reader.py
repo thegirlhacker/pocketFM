@@ -59,6 +59,13 @@ def extract_issue_keywords(issue_description: str, max_keywords: int = 12) -> li
         if not candidate:
             continue
 
+        if candidate.endswith(".go"):
+            candidate = candidate[:-3]
+        if "/" in candidate:
+            candidate = candidate.split("/")[-1]
+        if "\\" in candidate:
+            candidate = candidate.split("\\")[-1]
+
         candidate = candidate.split("(")[0].split(".")[-1].strip()
         normalized = candidate.lower()
         if normalized in STOP_WORDS or normalized in seen:
@@ -200,8 +207,13 @@ def read_function(repo_path: str, filepath: str, function_name: str) -> str:
     except Exception as exc:
         return f"Error reading file: {exc}"
 
-    # Match standard func Name() or func (r Receiver) Name()
-    func_pattern = re.compile(r"^func\s+(?:(?:\([^)]+\)\s+)?)" + re.escape(function_name) + r"\b\s*\(")
+    # Clean up function_name if it includes package or receiver prefixes
+    if "." in function_name:
+        function_name = function_name.split(".")[-1]
+    function_name = re.sub(r'[()*]', '', function_name).strip()
+
+    # Match standard func Name() or func (r Receiver) Name(), including optional generic type params
+    func_pattern = re.compile(r"^\s*func\s+(?:(?:\([^)]+\)\s+)?)" + re.escape(function_name) + r"\b(?:\s*\[[^\]]+\])?\s*\(")
     
     start_line_idx = -1
     for i, line in enumerate(lines):
@@ -216,14 +228,63 @@ def read_function(repo_path: str, filepath: str, function_name: str) -> str:
     in_func = False
     end_line_idx = -1
     
+    in_multiline_comment = False
+    in_raw_string = False
+    
     for i in range(start_line_idx, len(lines)):
         line = lines[i]
-        for char in line:
+        j = 0
+        while j < len(line):
+            if in_multiline_comment:
+                if j < len(line) - 1 and line[j] == '*' and line[j+1] == '/':
+                    in_multiline_comment = False
+                    j += 2
+                else:
+                    j += 1
+                continue
+                
+            if in_raw_string:
+                if line[j] == '`':
+                    in_raw_string = False
+                j += 1
+                continue
+                
+            if j < len(line) - 1 and line[j] == '/' and line[j+1] == '/':
+                break
+            if j < len(line) - 1 and line[j] == '/' and line[j+1] == '*':
+                in_multiline_comment = True
+                j += 2
+                continue
+            if line[j] == '`':
+                in_raw_string = True
+                j += 1
+                continue
+            if line[j] == '"':
+                j += 1
+                while j < len(line) and line[j] != '"':
+                    if line[j] == '\\':
+                        j += 2
+                    else:
+                        j += 1
+                j += 1
+                continue
+            if line[j] == '\'':
+                j += 1
+                while j < len(line) and line[j] != '\'':
+                    if line[j] == '\\':
+                        j += 2
+                    else:
+                        j += 1
+                j += 1
+                continue
+                
+            char = line[j]
             if char == '{':
                 brace_count += 1
                 in_func = True
             elif char == '}':
                 brace_count -= 1
+            j += 1
         
         if in_func and brace_count == 0:
             end_line_idx = i

@@ -1,80 +1,88 @@
 # Agentic PR Builder
 
-[![Built by thegirlhacker](https://img.shields.io/badge/Built_by-thegirlhacker-blue.svg)](https://github.com/thegirlhacker)
-[![Python Version](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+An autonomous CLI tool designed to locate, fix, and validate bugs in Go repositories. Give it a repository URL and a bug report, and the agent will localize the relevant files, draft a patch, validate the fix using local tests (or auto-download a Go toolchain if missing), and generate a detailed pull request summary.
 
-An autonomous AI agent platform that resolves issues in open-source Go projects. It automatically clones the target repository, uses a highly optimized 3-step search funnel to identify relevant code, reasons about the issue, plans a fix, applies the diff, validates it via `go build` and `go test`, and generates a Pull Request summary.
+## Core Features
 
-## ✨ Core Innovations & Architecture
-
-This project isn't just a simple API wrapper; it features a robust, multi-agent architecture with significant optimizations for context management and tool execution.
-
-### 🔍 1. The Deterministic 3-Step Search Funnel
-LLMs have finite context windows. Dumping an entire repository into an LLM is expensive and causes hallucinations. This system uses a highly optimized, deterministic search funnel to feed the agent exactly what it needs:
-1. **Keyword Extraction:** Dynamically parses the GitHub issue to extract code-like search terms (handling backticks, PascalCase, and Snake_case) while filtering out common English stop-words.
-2. **The Wide Grep Net:** Runs a global text search across the repository to find all files containing these keywords.
-3. **Symbol Matching & Ranking (The Sorter):** Parses the matched files using regex (`GO_SYMBOL_PATTERN`) to find actual Go structural definitions (`func` or `type`). Files are ranked by a strict score: **(Exact Symbol Hits, Total Match Density)**. The top 5 files are fed to the Planner.
-
-### 🧠 2. Multi-Agent LLM Pipeline (ReAct Loop)
-The system divides labor into specialized roles, operating in a strict Thought -> Action -> Observation (ReAct) loop:
-* **The Planner:** Reads the heavily ranked files, investigates using tools (`tree`, `grep`, `read_file`), and formulates an actionable architectural plan.
-* **The Coder:** Takes the Planner's output and strictly focuses on writing an accurate, `git apply` compatible unified diff.
-* **The Validator:** Applies the fix and runs localized environment tests.
-* **The PR Generator:** Synthesizes the final diff and original issue into a professional Markdown Pull Request summary.
-
-### ⚡ 3. Advanced Optimizations & Resilience
-* **Context Explosion Protection:** Prevents API `413 Payload Too Large` errors via intelligent conversation history truncation (keeping the system prompt and the most recent 8 messages) and hard limits on file reads (truncating reads over 15,000 characters).
-* **Robust Diff Application:** LLMs notoriously struggle with precise diff formatting. The `diff_applier.py` forces `a/` and `b/` header prefixes, extracts raw code blocks, attempts strict `git apply --ignore-space-change`, and automatically falls back to the more lenient `patch -p1` utility if git rejects it.
-* **Graceful Degradation:** The Go Validator dynamically checks the host environment (`shutil.which("go")`). If the Go toolchain isn't installed, it gracefully bypasses the validation phase rather than crashing the entire pipeline.
-* **Automated Rollbacks:** If the Coder generates an invalid patch, or the validation stage fails, the system automatically runs `git reset --hard` and `git clean -fd`, feeding the exact error logs back to the Coder for a self-correction retry.
-
-### 🔌 4. Extensibility
-* **Dynamic Tool Registry:** The system features a plug-and-play `ToolRegistry`. Tools like `grep_search` and `tree_mapper` are registered in Python, and their descriptions/schemas are dynamically injected into the LLM's system prompts. Adding a new capability takes 3 lines of code.
-* **Model Agnostic:** Built entirely on the standard OpenAI SDK, making it seamlessly compatible with OpenAI, Azure, GitHub Models, or local models via Ollama/vLLM.
+- **AST-Like Search Funnel**: Before calling any LLM, the tool runs a keyword extraction step on the issue, performs a codebase-wide grep, and scores files using Go symbol matching (functions/types/structs) combined with match density to find the best candidate files.
+- **Two-Agent ReAct Workflow**:
+  - **Planner**: Investigates the codebase using search tools (`tree`, `grep`, `read_file`), localizes the issue, and compiles a strategy.
+  - **Coder**: Takes the plan and generates a `git apply`-compatible unified diff.
+- **Self-Healing Validation Loop**: Automatically runs `go build` and `go test` on modified packages. If compiler or test errors occur, it feeds the compile/test error logs and the surrounding context of the failing files back to the Coder for up to 3 automatic retries.
+- **Context Management**: Avoids token bloat and `413 Payload Too Large` errors by keeping system instructions compact, capping read operations to 15KB, and managing short-term history memory (sliding window keeping only the system context + the latest 8 messages).
+- **Environment Autodetection**: Automatically detects your API key type and base URL. It supports OpenAI, Gemini, Groq, and GitHub Models. If `go` is not installed on the system, it automatically pulls a sandboxed Go toolchain to validate changes.
 
 ---
 
-## 🚀 Setup Instructions
+## Architecture Flow
 
-1. **Initialize the Environment:**
-    ```bash
-    # Create and activate virtual environment
-    python -m venv venv
-    source venv/bin/activate  # Or `venv\Scripts\activate` on Windows
-    
-    # Install dependencies
-    pip install -r requirements.txt
-    ```
+```
+[Issue Text] ──> Keyword Extraction ──> Global Grep Net ──> Go Symbol Ranking
+                                                                   │
+                                                                   ▼
+[PR Summary] <── PR Generator <── [Passed tests] <── Coder & Validation Loop (up to 3x)
+```
 
-2. **Configuration:**
-    The system supports any OpenAI-compatible API (including GitHub Models, which provides free access to `gpt-4o`).
-    
-    * Copy the `.env` template or create a `.env` file in the root directory:
-      ```env
-      # Example: Using a free GitHub Personal Access Token (PAT)
-      OPENAI_API_KEY="github_pat_YourTokenHere"
-      # Base URL (Optional: Defaults to GitHub Models if token starts with ghp_)
-      # OPENAI_BASE_URL="https://models.inference.ai.azure.com"
-      ```
+---
 
-3. **Run the Agent:**
-    ```bash
-    python main.py
-    ```
-    The CLI will interactively ask you to:
-    1. Paste the URL of the GitHub repository (e.g., `https://github.com/gin-gonic/gin`).
-    2. Paste the exact Issue description.
-    3. Sit back and watch it fix the issue!
+## Codebase Tour
 
-## 🎯 Target Projects
+- `main.py`: Entry point for the CLI. Manages repo cloning, environment variables, base URL mapping, and runs the main loop.
+- `core/`:
+  - `orchestrator.py`: Implements `AgentOrchestrator` which coordinates the Planner, Coder, and PR Generator agents.
+  - `prompts/`: Standardized system templates for the agents.
+- `tools/`:
+  - `search/`: Contains `grep_tool.py` for keyword searches and `tree_mapper.py` for directory exploration.
+  - `editor/`: `file_reader.py` parses symbols/functions and handles scoring. `diff_applier.py` handles parsing code diffs and applying patches using `git apply` or `patch` (with `-p0` and `-p1` fallbacks).
+  - `validator/`: `go_tester.py` compiles directories and runs unit tests. It also manages downloading a temporary Go binary if local Go is unavailable.
 
-This tool is specifically tuned and tested for major open-source Go projects, including but not limited to:
-* [spf13/cobra](https://github.com/spf13/cobra)
-* [gin-gonic/gin](https://github.com/gin-gonic/gin)
-* [go-playground/validator](https://github.com/go-playground/validator)
-* [golangci/golangci-lint](https://github.com/golangci/golangci-lint)
+---
 
-## 🤝 Contributing
+## Setup & Configuration
 
-Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/thegirlhacker/pocketFM/issues).
+### Prerequisites
+- Python 3.12 or higher
+- Git
+
+### Installation
+
+1. Clone the repository and navigate to its root:
+   ```bash
+   git clone https://github.com/thegirlhacker/pocketFM.git
+   cd pocketFM
+   ```
+
+2. Create a virtual environment and install the required dependencies:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+
+3. Create a `.env` file in the root directory:
+   ```env
+   # Set the API key for your preferred provider
+   GEMINI_API_KEY="your-gemini-api-key"
+   # OR
+   OPENAI_API_KEY="your-openai-api-key"
+   # OR
+   GROQ_API_KEY="your-groq-api-key"
+
+   # Optional base URL override (detected automatically based on key structure if omitted)
+   # OPENAI_BASE_URL="https://models.inference.ai.azure.com"
+   ```
+
+---
+
+## Usage
+
+Run the tool using:
+```bash
+python3 main.py
+```
+
+### Flow of Execution:
+1. **GitHub URL**: The prompt will ask you to paste the URL of the Go repository.
+2. **Issue Description**: Paste the issue description or error report (press Enter twice to submit).
+3. **Execution**: The tool will clone the target repository, run search scoring, execute the Planner and Coder loops, validate the fix by compiling and running tests, and output a conventional PR description along with the final diff.
+4. **Cleanup**: Cloned repository files are cleaned up upon successful completion or interruption.

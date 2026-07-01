@@ -70,9 +70,9 @@ def main():
     console.print(Panel.fit("[bold blue]🤖 AGENTIC PR BUILDER: AUTONOMOUS BUG FIXER[/bold blue]", border_style="blue"))
     
     # Check API Key
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not api_key:
-        console.print("[bold red]❌ API Key is missing! Set GROQ_API_KEY in your .env file.[/bold red]")
+        console.print("[bold red]❌ API Key is missing! Set GEMINI_API_KEY, OPENAI_API_KEY, or GROQ_API_KEY in your .env file.[/bold red]")
         sys.exit(1)
 
     # Get User Inputs
@@ -108,18 +108,28 @@ def main():
         # Handover to Agent
         console.print("\n[bold cyan]🧠 STEP 4: HANDING OVER TO THE AGENT[/bold cyan]")
         
-        # Smart base_url detection: Use Groq default if nothing is specified.
+        # Smart base_url detection: Use default if nothing is specified.
         base_url = os.environ.get("OPENAI_BASE_URL")
+        model = "gpt-4o"
+        
         if not base_url:
-            if api_key.startswith("ghp_") or api_key.startswith("github_pat_"):
+            if os.environ.get("GEMINI_API_KEY") and api_key == os.environ.get("GEMINI_API_KEY"):
+                base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+                model = "gemini-2.5-flash"
+            elif api_key.startswith("ghp_") or api_key.startswith("github_pat_"):
                 base_url = "https://models.inference.ai.azure.com"
+            elif api_key.startswith("sk-"):
+                # If it's a standard OpenAI key, use default OpenAI endpoints
+                base_url = None
             else:
                 base_url = "https://api.groq.com/openai/v1"
+                model = "llama-3.3-70b-versatile"
 
         agent = AgentOrchestrator(
             repo_path=local_repo_path, 
             api_key=api_key, 
-            base_url=base_url 
+            base_url=base_url,
+            model=model
         )
         
         # Start the Autonomous Loop
@@ -131,7 +141,7 @@ def main():
         console.print(f"\n[bold red]❌ A fatal error occurred: {e}[/bold red]")
     finally:
         # STEP 5: THE CLEANUP
-        if local_repo_path:
+        if local_repo_path and local_repo_was_cloned:
             console.print("\n[bold cyan]♻️  STEP 5: INITIATING CLEANUP[/bold cyan]")
             cleanup_repo(local_repo_path)
             
@@ -139,3 +149,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

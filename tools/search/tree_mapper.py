@@ -10,13 +10,22 @@ def get_repo_structure(repo_path: str, max_depth: int = 4) -> str:
     if not os.path.exists(repo_path):
         return f"Error: Repository path '{repo_path}' does not exist."
 
+    try:
+        max_depth = int(max_depth)
+    except (ValueError, TypeError):
+        max_depth = 4
+
     ignore_dirs, ignore_exts = get_dynamic_ignore_patterns(repo_path)
     tree_str = f"Repository Map for: {os.path.basename(os.path.abspath(repo_path))}\n"
     
     for root, dirs, files in os.walk(repo_path):
         dirs[:] = [d for d in dirs if d not in ignore_dirs]
         
-        level = root.replace(repo_path, '').count(os.sep)
+        if root == repo_path:
+            level = 0
+        else:
+            rel_path = os.path.relpath(root, repo_path)
+            level = rel_path.count(os.sep) + 1
         
         if level == max_depth:
             indent = ' ' * 4 * level

@@ -26,15 +26,15 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 class AgentOrchestrator:
-    def __init__(self, repo_path: str, api_key: str, base_url: str = "https://api.groq.com/openai/v1"):
+    def __init__(self, repo_path: str, api_key: str, base_url: str = None, model: str = "gpt-4o"):
         self.repo_path = repo_path
         if base_url:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
         else:
             self.client = OpenAI(api_key=api_key)
         
-        # Using Groq Everywhere Strategy for simplicity and reliability
-        self.model = "llama-3.1-70b-versatile" 
+        # Accept dynamic model from main.py
+        self.model = model 
         
         # Loading Prompts
         self.planner_sys_prompt = load_prompt("planner_prompt")
@@ -118,31 +118,86 @@ class AgentOrchestrator:
     def read_file_tool(self, filepath: str, start_line: int = None, end_line: int = None) -> str:
         """Read a Go file through the editor file reader, optionally limiting to specific lines."""
         content = read_file_with_line_numbers(self.repo_path, filepath)
-        if start_line is not None and end_line is not None:
+        if content.startswith("Error"):
+            return content
+        if start_line is not None or end_line is not None:
             lines = content.splitlines()
-            # 1-indexed to 0-indexed logic
-            start_idx = max(0, start_line - 1)
-            end_idx = min(len(lines), end_line)
+            start_idx = 0
+            end_idx = len(lines)
+            if start_line is not None:
+                try:
+                    start_idx = max(0, int(start_line) - 1)
+                except (ValueError, TypeError):
+                    pass
+            if end_line is not None:
+                try:
+                    end_idx = min(len(lines), int(end_line))
+                except (ValueError, TypeError):
+                    pass
             return "\n".join(lines[start_idx:end_idx])
         return content
+
 
     def parse_tool_call(self, text: str):
         """Extracts tool name and arguments from the LLM's response."""
         match = re.search(r'TOOL_CALL:\s*([a-zA-Z_]+)\((.*?)\)', text, re.DOTALL)
         if match:
+            tool_name = match.group(1)
+            args_str = match.group(2).strip()
+            
+            # If the LLM omitted the braces but used key-value pairs
+            if not args_str.startswith("{") and ":" in args_str:
+                args_str = "{" + args_str + "}"
+                
             try:
-                return match.group(1), json.loads(match.group(2))
-            except json.JSONDecodeError:
-                return match.group(1), {}
+                import ast
+                return tool_name, ast.literal_eval(args_str)
+            except Exception:
+                try:
+                    return tool_name, json.loads(args_str)
+                except Exception:
+                    # Fallback parsing of keyword arguments: key=value
+                    args_dict = {}
+                    kw_pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(["\'])(.*?)\2|([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([0-9]+)'
+                    for m in re.finditer(kw_pattern, args_str):
+                        if m.group(1):
+                            args_dict[m.group(1)] = m.group(3)
+                        elif m.group(4):
+                            args_dict[m.group(4)] = int(m.group(5))
+                    if args_dict:
+                        return tool_name, args_dict
+                    return tool_name, {}
         return None, None
 
-    def _handle_rate_limit(self, e: Exception):
-        msg = f"[bold red]API Rate Limit Exceeded[/bold red]\n\n"
-        msg += "The system hit the request limit for your current API key provider.\n"
-        msg += f"[dim]Details: {e}[/dim]\n\n"
-        msg += "If you are using the free GitHub Models API, there is a strict limit of 50 requests per day. "
-        msg += "To continue testing, please supply a standard OpenAI API key in your `.env` file or wait for the limit to reset."
-        console.print(Panel(msg, border_style="red"))
+    def _safe_api_call(self, messages, temperature=0.2, max_retries=10, initial_delay=5):
+        """Wraps the OpenAI API call in an exponential backoff loop to handle 429s automatically."""
+        delay = initial_delay
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature
+                )
+                return response
+            except (openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError) as e:
+                if attempt == max_retries - 1:
+                    console.print(f"[bold red]❌ Exhausted API retries after {max_retries} attempts: {e}[/bold red]")
+                    raise
+                
+                # Check if the API specifically requested an 18s wait time
+                wait_time = delay
+                err_msg = str(e)
+                if "18s" in err_msg or "18." in err_msg:
+                    wait_time = max(wait_time, 20)
+                
+                console.print(f"[yellow]⏳ Transient API Error / Rate Limit Hit ({type(e).__name__}). Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})[/yellow]")
+                time.sleep(wait_time)
+                delay *= 1.5  # Exponential backoff
+            except Exception as e:
+                # Let other exceptions crash immediately
+                console.print(f"[bold red]❌ Unexpected API Error: {e}[/bold red]")
+                raise
 
     def _animate_diff(self, final_fix: str):
         """Creates a beautiful typing effect for code changes in red and green."""
@@ -153,16 +208,23 @@ class AgentOrchestrator:
         if not diff_text:
             diff_text = final_fix
 
-        for line in diff_text.splitlines():
+        lines = diff_text.splitlines()
+        num_lines = len(lines)
+        
+        # Calculate dynamic delay to avoid taking too long for larger diffs
+        del_add_remove = max(0.005, min(0.08, 4.0 / max(1, num_lines)))
+        del_context = max(0.001, min(0.02, 1.0 / max(1, num_lines)))
+
+        for line in lines:
             if line.startswith("-") and not line.startswith("---"):
                 console.print(f"[bold red]{line}[/bold red]")
-                time.sleep(0.08)  # Typing delay for removed code
+                time.sleep(del_add_remove)  # Typing delay for removed code
             elif line.startswith("+") and not line.startswith("+++"):
                 console.print(f"[bold green]{line}[/bold green]")
-                time.sleep(0.08)  # Typing delay for added code
+                time.sleep(del_add_remove)  # Typing delay for added code
             else:
                 console.print(f"[dim]{line}[/dim]")
-                time.sleep(0.02)  # Fast scroll for unchanged context
+                time.sleep(del_context)  # Fast scroll for unchanged context
         
         console.print("\n[bold green]✅ Code successfully updated![/bold green]")
         time.sleep(2) # 2-second pause before validation
@@ -175,19 +237,11 @@ class AgentOrchestrator:
             # Anti 413 Payload Too Large Logic for GitHub Models
             # We keep system, original prompt, and only the last few messages
             if len(messages) > 10:
-                messages = messages[:2] + messages[-8:]
+                messages[:] = messages[:2] + messages[-8:]
                 
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=0.2
-                )
-            except openai.RateLimitError as e:
-                self._handle_rate_limit(e)
-                return None
-            except Exception as e:
-                console.print(f"[bold red]❌ Unexpected API Error: {e}[/bold red]")
+                response = self._safe_api_call(messages, temperature=0.2)
+            except Exception:
                 return None
             
             reply = response.choices[0].message.content
@@ -196,6 +250,10 @@ class AgentOrchestrator:
             # Check if agent reached its goal (PLAN_COMPLETE or FINAL_FIX)
             if stop_word in reply:
                 return reply.split(stop_word)[-1].strip()
+
+            # Check if the Planner rejected the issue
+            if "PLAN_REJECTED:" in reply:
+                return "PLAN_REJECTED:" + reply.split("PLAN_REJECTED:")[-1]
 
             # Otherwise, check for tool usage
             tool_name, tool_args = self.parse_tool_call(reply)
@@ -221,26 +279,27 @@ class AgentOrchestrator:
         """Calls the PR Generator LLM to write a PR title and body."""
         console.print("\n[bold cyan]📝 STAGE 4: GENERATING PULL REQUEST SUMMARY...[/bold cyan]")
         time.sleep(1)
+        
+        diff_text = _extract_unified_diff(final_fix)
+        if not diff_text:
+            import subprocess
+            git_diff_proc = subprocess.run(["git", "diff"], cwd=self.repo_path, capture_output=True, text=True)
+            diff_text = git_diff_proc.stdout
+            if not diff_text:
+                diff_text = final_fix
+
         messages = [
             {"role": "system", "content": self.pr_generator_sys_prompt},
             {
                 "role": "user",
-                "content": f"Issue:\n{issue_description}\n\nCode Diff:\n{final_fix}"
+                "content": f"Issue:\n{issue_description}\n\nCode Diff:\n{diff_text}"
             }
         ]
         
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.3
-            )
+            response = self._safe_api_call(messages, temperature=0.3)
             return response.choices[0].message.content
-        except openai.RateLimitError as e:
-            self._handle_rate_limit(e)
-            return "Failed to generate PR summary due to API Rate Limits."
-        except Exception as e:
-            console.print(f"[bold red]❌ Unexpected API Error: {e}[/bold red]")
+        except Exception:
             return "Failed to generate PR summary due to an API Error."
 
     # --- THE MASTER FLOW ---
@@ -282,6 +341,11 @@ class AgentOrchestrator:
             console.print("[bold red]❌ Planner failed to create a plan within step limit or due to API errors.[/bold red]")
             return
 
+        if plan.startswith("PLAN_REJECTED:"):
+            reason = plan.replace("PLAN_REJECTED:", "").strip()
+            console.print(Panel(f"[bold red]Issue Rejected:[/bold red] The issue is out of scope.\n\n[bold white]Reason:[/bold white]\n{reason}", title="Aborted", border_style="red"))
+            return
+
         console.print(Panel(Markdown(plan), title="Action Plan", border_style="green"))
         time.sleep(1.5)
 
@@ -310,7 +374,7 @@ class AgentOrchestrator:
         for attempt in range(1, MAX_RETRIES + 1):
             console.print(f"\n[bold cyan]👨‍💻 STAGE 2: CODER IS WRITING FIX (Attempt {attempt}/{MAX_RETRIES})...[/bold cyan]")
             
-            final_fix = self._run_agent_loop(coder_messages, max_steps=8, stop_word="FINAL_FIX:")
+            final_fix = self._run_agent_loop(coder_messages, max_steps=15, stop_word="FINAL_FIX:")
             
             if not final_fix:
                 console.print("[bold red]❌ Coder failed to generate a fix within step limit or due to API errors.[/bold red]")
@@ -336,18 +400,30 @@ class AgentOrchestrator:
             console.print("[green]✅ Diff applied successfully to local repository.[/green]")
             console.print("[dim]Running Syntax Check (Local) & Blast Radius Check (Global)...[/dim]")
             
-            modified_files = extract_modified_files(final_fix)
+            modified_files = extract_modified_files(final_fix, self.repo_path)
             valid, val_msg, failing_context = run_go_validation(self.repo_path, modified_files)
             
             if valid:
                 console.print("[bold green]✅ Validation successful! Code compiles and tests pass.[/bold green]")
-                # Flash final code in green for a few seconds
+                # Show the final code diff
                 time.sleep(1)
-                console.print("\n[bold green]FINAL VALIDATED CODE INTEGRATED:[/bold green]")
-                # We print it out very fast in full green
-                for line in _extract_unified_diff(final_fix).splitlines():
-                    if line.startswith("+") and not line.startswith("+++"):
+                console.print("\n[bold cyan]FINAL VALIDATED CODE INTEGRATED:[/bold cyan]")
+                
+                diff_to_print = _extract_unified_diff(final_fix)
+                if not diff_to_print:
+                    import subprocess
+                    git_diff_proc = subprocess.run(["git", "diff"], cwd=self.repo_path, capture_output=True, text=True)
+                    diff_to_print = git_diff_proc.stdout
+                    
+                for line in diff_to_print.splitlines():
+                    if line.startswith("+++") or line.startswith("---"):
+                        console.print(f"[bold cyan]{line}[/bold cyan]")
+                    elif line.startswith("+"):
                         console.print(f"[bold green]{line}[/bold green]")
+                    elif line.startswith("-"):
+                        console.print(f"[bold red]{line}[/bold red]")
+                    else:
+                        console.print(f"[dim]{line}[/dim]")
                 time.sleep(3) # Wait 3 seconds
                 
                 final_fix_to_use = final_fix

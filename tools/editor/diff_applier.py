@@ -15,14 +15,18 @@ def extract_modified_files(diff_text: str, repo_path: str = None) -> list[str]:
     """Parses the diff to find which files are being modified. Fallback to git status if no diff."""
     files = []
     for line in diff_text.splitlines():
-        if line.startswith("+++ b/"):
-            files.append(line[6:].strip())
+        if line.startswith("+++ "):
+            path = line[4:].split('\t')[0].strip()
+            if path.startswith("a/") or path.startswith("b/"):
+                path = path[2:]
+            if path != "/dev/null":
+                files.append(path)
             
     if not files and repo_path:
         status = subprocess.run(["git", "diff", "--name-only"], cwd=repo_path, capture_output=True, text=True)
         files = [f.strip() for f in status.stdout.splitlines() if f.strip()]
         
-    return files
+    return list(dict.fromkeys(files))
 
 
 def apply_git_diff(repo_path: str, final_fix: str) -> tuple[bool, str]:
@@ -41,28 +45,53 @@ def apply_git_diff(repo_path: str, final_fix: str) -> tuple[bool, str]:
     with os.fdopen(fd, 'w') as f:
         f.write(unified_diff + "\n")
 
+    errors = []
     try:
-        # Use git apply
+        # Try git apply with default -p1
         process = subprocess.run(
             ["git", "apply", "--ignore-space-change", "--ignore-whitespace", temp_path],
             cwd=repo_path,
             capture_output=True,
             text=True
         )
-        
         if process.returncode == 0:
             return True, "Diff applied successfully."
-        else:
-            # Fallback to patch utility if git apply is too strict
-            patch_process = subprocess.run(
-                ["patch", "-p1", "-i", temp_path],
-                cwd=repo_path,
-                capture_output=True,
-                text=True
-            )
-            if patch_process.returncode == 0:
-                return True, "Diff applied successfully via patch fallback."
-            return False, f"Failed to apply diff:\nGit apply error: {process.stderr}\nPatch fallback error: {patch_process.stderr}"
+        errors.append(f"git apply -p1 error: {process.stderr.strip()}")
+
+        # Try git apply with -p0 (no a/ b/ prefixes)
+        process_p0 = subprocess.run(
+            ["git", "apply", "-p0", "--ignore-space-change", "--ignore-whitespace", temp_path],
+            cwd=repo_path,
+            capture_output=True,
+            text=True
+        )
+        if process_p0.returncode == 0:
+            return True, "Diff applied successfully with git apply -p0."
+        errors.append(f"git apply -p0 error: {process_p0.stderr.strip()}")
+
+        # Fallback to patch utility with -p1
+        patch_process = subprocess.run(
+            ["patch", "-p1", "--batch", "-i", temp_path],
+            cwd=repo_path,
+            capture_output=True,
+            text=True
+        )
+        if patch_process.returncode == 0:
+            return True, "Diff applied successfully via patch fallback."
+        errors.append(f"patch -p1 error: {patch_process.stderr.strip()}")
+
+        # Fallback to patch utility with -p0
+        patch_process_p0 = subprocess.run(
+            ["patch", "-p0", "--batch", "-i", temp_path],
+            cwd=repo_path,
+            capture_output=True,
+            text=True
+        )
+        if patch_process_p0.returncode == 0:
+            return True, "Diff applied successfully via patch fallback -p0."
+        errors.append(f"patch -p0 error: {patch_process_p0.stderr.strip()}")
+
+        return False, "Failed to apply diff:\n" + "\n".join(errors)
     finally:
         os.remove(temp_path)
 
@@ -101,6 +130,11 @@ def _extract_unified_diff(text: str) -> str:
 
     if diff_blocks:
         return "\n\n".join(diff_blocks)
+
+    # Try to find a raw diff in the text if it's not enclosed in markdown code blocks
+    match = re.search(r"((?:diff --git|--- [ab]/|--- \S+).*?)(?:\n\n\w|\Z)", text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
 
     if text.lstrip().startswith(("diff --git", "--- ")):
         return text
