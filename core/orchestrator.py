@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import logging
@@ -14,13 +15,13 @@ from tools.editor.diff_applier import (
     apply_git_diff,
     revert_repo,
     extract_modified_files,
+    edit_file_tool,
     _extract_unified_diff,
 )
 from tools.editor.file_reader import (
-    format_ranked_files,
-    rank_relevant_files,
+    find_relevant_files,
     read_file_with_line_numbers,
-    read_ranked_files,
+    read_function as _read_function,
 )
 from tools.validator.go_tester import run_go_validation
 from core.file_utils import load_prompt, MAX_CONTEXT
@@ -43,6 +44,8 @@ class AgentOrchestrator:
     The ReAct loop mechanics (parse_tool_call, safe_api_call, run_agent_loop)
     live in core/agent_loop.py so this class stays focused on pipeline logic.
     """
+
+    MAX_RETRIES = 3   # maximum coder + validation attempts before giving up
 
     def __init__(
         self,
@@ -92,8 +95,7 @@ class AgentOrchestrator:
             Uses Python to parse a Go file and extracts ONLY the exact function block.
             Use this to read code before attempting an edit. Do not guess the code.
             """
-            from tools.editor.file_reader import read_function as _read_func
-            return _read_func(self.repo_path, filepath, function_name)
+            return _read_function(self.repo_path, filepath, function_name)
 
         def edit_file(filepath: str, old_snippet: str, new_snippet: str) -> str:
             """
@@ -101,7 +103,6 @@ class AgentOrchestrator:
             CRITICAL: 'old_snippet' MUST match the existing code in the file EXACTLY,
             including all spaces, tabs, and indentation. Do not omit any characters.
             """
-            from tools.editor.diff_applier import edit_file_tool
             return edit_file_tool(self.repo_path, filepath, old_snippet, new_snippet)
 
         self.tool_registry.register("grep", grep)
@@ -165,6 +166,16 @@ class AgentOrchestrator:
             prompt += agents_context
         return prompt
 
+    def _get_final_diff(self, final_fix: str) -> str:
+        """Returns the unified diff from the fix text, falling back to git diff."""
+        diff = _extract_unified_diff(final_fix)
+        if not diff:
+            result = subprocess.run(
+                ["git", "diff"], cwd=self.repo_path, capture_output=True, text=True
+            )
+            diff = result.stdout or final_fix
+        return diff
+
     def _animate_diff(self, final_fix: str):
         """Typing-effect display of the diff before it is applied."""
         console.print("\n[bold cyan]✨ APPLYING CHANGES...[/bold cyan]")
@@ -202,12 +213,7 @@ class AgentOrchestrator:
         console.print("\n[bold cyan]📝 STAGE 4: GENERATING PULL REQUEST SUMMARY...[/bold cyan]")
         time.sleep(1)
 
-        diff_text = _extract_unified_diff(final_fix)
-        if not diff_text:
-            git_diff_proc = subprocess.run(
-                ["git", "diff"], cwd=self.repo_path, capture_output=True, text=True
-            )
-            diff_text = git_diff_proc.stdout or final_fix
+        diff_text = self._get_final_diff(final_fix)
 
         messages = [
             {"role": "system", "content": self.pr_generator_sys_prompt},
@@ -227,16 +233,14 @@ class AgentOrchestrator:
     def run(self, issue_description: str):
         """Entry point – runs all four stages end-to-end."""
 
-        # --- Pre-compute ranked file context ---
-        ranked_files = rank_relevant_files(self.repo_path, issue_description, limit=5)
-        ranked_summary = format_ranked_files(ranked_files)
-        ranked_context = read_ranked_files(self.repo_path, ranked_files, max_files=1)
-
-        if len(ranked_context) > MAX_CONTEXT:
-            ranked_context = (
-                ranked_context[:MAX_CONTEXT]
-                + "\n...[TRUNCATED: File too large. Use read_file with start_line and end_line to read the rest.]"
-            )
+        # --- Pre-compute ranked file context (runs before any LLM call) ---
+        ranked_files = find_relevant_files(self.repo_path, issue_description, limit=5)
+        if not ranked_files:
+            ranked_context = "No relevant files found from issue keywords."
+        else:
+            ranked_context = json.dumps(ranked_files, indent=2)
+            if len(ranked_context) > MAX_CONTEXT:
+                ranked_context = ranked_context[:MAX_CONTEXT] + "\n...[TRUNCATED]"
 
         agents_context = self._get_repo_agents_context()
 
@@ -250,9 +254,8 @@ class AgentOrchestrator:
                 "role": "user",
                 "content": (
                     f"Issue:\n{issue_description}\n\n"
-                    f"Deterministic 3-step search funnel result:\n{ranked_summary}\n\n"
-                    "Use Rank 1 first. If it does not explain the bug, inspect Rank 2 "
-                    "and Rank 3 before using tree exploration."
+                    f"Relevant files (ranked by match score, definitions first):\n{ranked_context}\n\n"
+                    "Investigate the top files. Use read_file or read_function for more detail."
                 ),
             },
         ]
@@ -295,14 +298,13 @@ class AgentOrchestrator:
                 "content": (
                     f"Issue:\n{issue_description}\n\n"
                     f"Action Plan:\n{plan}\n\n"
-                    f"Ranked candidate files:\n{ranked_summary}\n\n"
-                    f"Initial file evidence from file_reader.py:\n{ranked_context}\n\n"
-                    "Read any additional ranked files you need, then output only the code edits."
+                    f"Relevant files:\n{ranked_context}\n\n"
+                    "Read the files you need, then output only the code edits."
                 ),
             },
         ]
 
-        MAX_RETRIES = 3
+        MAX_RETRIES = self.MAX_RETRIES
         final_fix_to_use = None
 
         for attempt in range(1, MAX_RETRIES + 1):
@@ -353,27 +355,6 @@ class AgentOrchestrator:
 
             if valid:
                 console.print("[bold green]✅ Validation successful! Code compiles and tests pass.[/bold green]")
-                time.sleep(1)
-                console.print("\n[bold cyan]FINAL VALIDATED CODE INTEGRATED:[/bold cyan]")
-
-                diff_to_print = _extract_unified_diff(final_fix)
-                if not diff_to_print:
-                    git_diff_proc = subprocess.run(
-                        ["git", "diff"], cwd=self.repo_path, capture_output=True, text=True
-                    )
-                    diff_to_print = git_diff_proc.stdout
-
-                for line in diff_to_print.splitlines():
-                    if line.startswith("+++") or line.startswith("---"):
-                        console.print(f"[bold cyan]{line}[/bold cyan]")
-                    elif line.startswith("+"):
-                        console.print(f"[bold green]{line}[/bold green]")
-                    elif line.startswith("-"):
-                        console.print(f"[bold red]{line}[/bold red]")
-                    else:
-                        console.print(f"[dim]{line}[/dim]")
-
-                time.sleep(3)
                 final_fix_to_use = final_fix
                 break
 
