@@ -2,7 +2,6 @@ import os
 import logging
 from core.file_utils import get_dynamic_ignore_patterns
 
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 def get_repo_structure(repo_path: str, max_depth: int = 4) -> str:

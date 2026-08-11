@@ -1,5 +1,4 @@
 import re
-import textwrap
 import subprocess
 import os
 import tempfile
@@ -96,32 +95,6 @@ def apply_git_diff(repo_path: str, final_fix: str) -> tuple[bool, str]:
         os.remove(temp_path)
 
 
-def format_terminal_edits(final_fix: str | None) -> str:
-    """Format the coder output as terminal-ready proposed edits."""
-    cleaned_fix = (final_fix or "").strip()
-    if not cleaned_fix:
-        return "No code changes were produced."
-
-    unified_diff = _extract_unified_diff(cleaned_fix)
-    if unified_diff:
-        body = unified_diff
-    else:
-        body = _normalize_file_blocks(cleaned_fix)
-        if not body:
-            body = cleaned_fix
-
-    return "\n".join(
-        [
-            "",
-            "=" * 72,
-            "PROPOSED CODE CHANGES",
-            "=" * 72,
-            body.strip(),
-            "=" * 72,
-        ]
-    )
-
-
 def _extract_unified_diff(text: str) -> str:
     diff_blocks = []
     for language, block in re.findall(r"```(\w*)\n(.*?)```", text, re.DOTALL):
@@ -140,22 +113,6 @@ def _extract_unified_diff(text: str) -> str:
         return text
 
     return ""
-
-
-def _normalize_file_blocks(text: str) -> str:
-    code_blocks = re.findall(r"```(?:go)?\n(.*?)```", text, re.DOTALL)
-    if not code_blocks:
-        return textwrap.dedent(text).strip()
-
-    intro = text.split("```", 1)[0].strip()
-    sections = []
-    if intro:
-        sections.append(intro)
-
-    for block in code_blocks:
-        sections.append("```go\n" + block.strip() + "\n```")
-
-    return "\n\n".join(sections)
 
 
 def edit_file_tool(repo_path: str, filepath: str, old_snippet: str, new_snippet: str) -> str:

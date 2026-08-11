@@ -1,5 +1,8 @@
 import os
 
+# Maximum characters of file/tool output sent to the LLM in a single message.
+MAX_CONTEXT = 15_000
+
 
 DEFAULT_IGNORE_DIRS = {
     ".git",

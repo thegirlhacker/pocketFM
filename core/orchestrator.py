@@ -1,9 +1,8 @@
-import json
-import re
 import os
 import time
 import logging
-import openai
+import subprocess
+
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
@@ -11,7 +10,12 @@ from rich.markdown import Markdown
 
 from tools.search.grep_tool import grep_search
 from tools.search.tree_mapper import get_repo_structure
-from tools.editor.diff_applier import format_terminal_edits, apply_git_diff, revert_repo, extract_modified_files, _extract_unified_diff
+from tools.editor.diff_applier import (
+    apply_git_diff,
+    revert_repo,
+    extract_modified_files,
+    _extract_unified_diff,
+)
 from tools.editor.file_reader import (
     format_ranked_files,
     rank_relevant_files,
@@ -19,59 +23,82 @@ from tools.editor.file_reader import (
     read_ranked_files,
 )
 from tools.validator.go_tester import run_go_validation
-from core.file_utils import load_prompt
+from core.file_utils import load_prompt, MAX_CONTEXT
 from tools.registry.tool_registry import ToolRegistry
+from core.agent_loop import run_agent_loop, safe_api_call
 
 console = Console()
 logger = logging.getLogger(__name__)
 
+
 class AgentOrchestrator:
-    def __init__(self, repo_path: str, api_key: str, base_url: str = None, model: str = "gpt-4o"):
+    """
+    Coordinates the four-stage autonomous repair pipeline:
+
+      Stage 1 – Planner  : investigates the issue, produces an action plan.
+      Stage 2 – Coder    : writes a fix following the plan.
+      Stage 3 – Validator: applies the diff, runs go build + go test, reverts on failure.
+      Stage 4 – PR Gen   : writes a PR title + body for the validated change.
+
+    The ReAct loop mechanics (parse_tool_call, safe_api_call, run_agent_loop)
+    live in core/agent_loop.py so this class stays focused on pipeline logic.
+    """
+
+    def __init__(
+        self,
+        repo_path: str,
+        api_key: str,
+        base_url: str = None,
+        model: str = "gpt-4o",
+    ):
         self.repo_path = repo_path
+        self.model = model
+
         if base_url:
             self.client = OpenAI(api_key=api_key, base_url=base_url)
         else:
             self.client = OpenAI(api_key=api_key)
-        
-        # Accept dynamic model from main.py
-        self.model = model 
-        
-        # Loading Prompts
+
+        # Load system prompts
         self.planner_sys_prompt = load_prompt("planner_prompt")
         self.coder_sys_prompt = load_prompt("coder_prompt")
         self.pr_generator_sys_prompt = load_prompt("pr_generator_prompt")
-        
-        # Initialize Tool Registry
+
+        # Build tool registry
         self.tool_registry = ToolRegistry()
         self._register_tools()
 
+    # ------------------------------------------------------------------
+    # Tool registration
+    # ------------------------------------------------------------------
+
     def _register_tools(self):
-        """Registers all available tools dynamically."""
-        
+        """Registers all tools as closures so they capture self.repo_path."""
+
         def grep(keyword: str) -> str:
             """Searches the codebase for a keyword. Returns file paths and occurrences."""
             return grep_search(self.repo_path, keyword)
-            
+
         def tree(depth: int = 3) -> str:
             """Shows the repository folder structure up to a certain depth."""
             return get_repo_structure(self.repo_path, depth)
 
         def read_file(filepath: str, start_line: int = None, end_line: int = None) -> str:
-            """Reads file content with exact line numbers. ALWAYS use start_line and end_line to prevent truncation on large files."""
-            return self.read_file_tool(filepath, start_line, end_line)
+            """Reads file content with exact line numbers. Use start_line and end_line to prevent truncation on large files."""
+            return self._read_file(filepath, start_line, end_line)
 
         def read_function(filepath: str, function_name: str) -> str:
             """
             Uses Python to parse a Go file and extracts ONLY the exact function block.
             Use this to read code before attempting an edit. Do not guess the code.
             """
-            from tools.editor.file_reader import read_function as read_func_tool
-            return read_func_tool(self.repo_path, filepath, function_name)
+            from tools.editor.file_reader import read_function as _read_func
+            return _read_func(self.repo_path, filepath, function_name)
 
         def edit_file(filepath: str, old_snippet: str, new_snippet: str) -> str:
             """
-            Search-and-Replace Editor Tool. 
-            CRITICAL: 'old_snippet' MUST match the existing code in the file EXACTLY, 
+            Search-and-Replace Editor Tool.
+            CRITICAL: 'old_snippet' MUST match the existing code in the file EXACTLY,
             including all spaces, tabs, and indentation. Do not omit any characters.
             """
             from tools.editor.diff_applier import edit_file_tool
@@ -83,40 +110,14 @@ class AgentOrchestrator:
         self.tool_registry.register("read_function", read_function)
         self.tool_registry.register("edit_file", edit_file)
 
-    def _get_repo_agents_context(self) -> str:
-        """Looks for AGENTS.md or .github/AGENTS.md to inject project-specific rules."""
-        candidate_paths = [
-            os.path.join(self.repo_path, "AGENTS.md"),
-            os.path.join(self.repo_path, ".github", "AGENTS.md"),
-            os.path.join(self.repo_path, "RULES.md")
-        ]
-        for path in candidate_paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        return f"\n\n--- REPOSITORY SPECIFIC RULES ({os.path.basename(path)}) ---\n{f.read().strip()}\n-----------------------------------\n"
-                except Exception as e:
-                    logger.warning(f"Failed to read {path}: {e}")
-        return ""
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def _inject_tools_into_prompt(self, prompt: str) -> str:
-        """Dynamically injects available tool descriptions into the system prompt."""
-        tool_descriptions = self.tool_registry.get_all_tool_descriptions()
-        # Replace the hardcoded tool block with the dynamic one if present
-        if "AVAILABLE TOOLS:" in prompt:
-             parts = prompt.split("AVAILABLE TOOLS:")
-             # Find the next section (like RULES:) or the end
-             end_parts = parts[1].split("RULES:", 1)
-             
-             new_prompt = f"{parts[0]}AVAILABLE TOOLS:\n{tool_descriptions}\n\n"
-             if len(end_parts) > 1:
-                 new_prompt += f"RULES:{end_parts[1]}"
-             return new_prompt
-             
-        return prompt
-
-    def read_file_tool(self, filepath: str, start_line: int = None, end_line: int = None) -> str:
-        """Read a Go file through the editor file reader, optionally limiting to specific lines."""
+    def _read_file(
+        self, filepath: str, start_line: int = None, end_line: int = None
+    ) -> str:
+        """Read a Go file, optionally limiting to a line range."""
         content = read_file_with_line_numbers(self.repo_path, filepath)
         if content.startswith("Error"):
             return content
@@ -137,145 +138,37 @@ class AgentOrchestrator:
             return "\n".join(lines[start_idx:end_idx])
         return content
 
+    def _get_repo_agents_context(self) -> str:
+        """Looks for AGENTS.md / .github/AGENTS.md / RULES.md and injects project-specific rules."""
+        candidate_paths = [
+            os.path.join(self.repo_path, "AGENTS.md"),
+            os.path.join(self.repo_path, ".github", "AGENTS.md"),
+            os.path.join(self.repo_path, "RULES.md"),
+        ]
+        for path in candidate_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        return (
+                            f"\n\n--- REPOSITORY SPECIFIC RULES ({os.path.basename(path)}) ---\n"
+                            f"{f.read().strip()}\n"
+                            "-----------------------------------\n"
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to read {path}: {e}")
+        return ""
 
-    def parse_tool_call(self, text: str):
-        """Extracts tool name and arguments from the LLM's response."""
-        # Try matching with parentheses first: TOOL_CALL: name(...)
-        match = re.search(r'TOOL_CALL:\s*([a-zA-Z_]+)\((.*?)\)', text, re.DOTALL)
-        if match:
-            tool_name = match.group(1)
-            args_str = match.group(2).strip()
-        else:
-            # Try matching without parentheses: TOOL_CALL: name: {...} or TOOL_CALL: name {...}
-            match = re.search(r'TOOL_CALL:\s*([a-zA-Z_]+)(?:\s*:\s*|\s+)(\{.*?\})', text, re.DOTALL)
-            if match:
-                tool_name = match.group(1)
-                args_str = match.group(2).strip()
-            else:
-                return None, None
-        
-        if not args_str:
-            return tool_name, {}
-
-        # 1. Try JSON / Python Dict parsing
-        cleaned = args_str
-        if cleaned.startswith("{") and cleaned.endswith("}"):
-            cleaned = cleaned[1:-1].strip()
-            
-        try:
-            import ast
-            parsed = ast.literal_eval("{" + cleaned + "}")
-            if isinstance(parsed, dict):
-                return tool_name, parsed
-        except Exception:
-            pass
-
-        try:
-            parsed = json.loads("{" + cleaned + "}")
-            if isinstance(parsed, dict):
-                return tool_name, parsed
-        except Exception:
-            pass
-
-        # 2. Try parsing key-value pairs (using either : or = and matching quoted/unquoted keys/values)
-        args_dict = {}
-        kv_pattern = r'(?:["\']?([a-zA-Z_][a-zA-Z0-9_]*)["\']?)\s*[:=]\s*(?:(["\'])(.*?)\2|([0-9.]+)|(True|False|None|nil))'
-        matches = re.findall(kv_pattern, cleaned)
-        if matches:
-            for m in matches:
-                key = m[0]
-                val_str = m[2] if m[1] else (m[3] if m[3] else m[4])
-                
-                # Convert type if numeric or boolean
-                if m[3]:
-                    if '.' in val_str:
-                        val = float(val_str)
-                    else:
-                        val = int(val_str)
-                elif val_str == "True":
-                    val = True
-                elif val_str == "False":
-                    val = False
-                elif val_str in ("None", "nil"):
-                    val = None
-                else:
-                    val = val_str
-                args_dict[key] = val
-            
-            if args_dict:
-                return tool_name, args_dict
-
-        # 3. Try parsing positional arguments
-        pos_args = []
-        pos_pattern = r'(?:(["\'])(.*?)\1|([0-9.]+)|(True|False|None|nil))'
-        matches = re.findall(pos_pattern, cleaned)
-        for m in matches:
-            val_str = m[1] if m[0] else (m[2] if m[2] else m[3])
-            if m[2]:
-                if '.' in val_str:
-                    val = float(val_str)
-                else:
-                    val = int(val_str)
-            elif val_str == "True":
-                val = True
-            elif val_str == "False":
-                val = False
-            elif val_str in ("None", "nil"):
-                val = None
-            else:
-                val = val_str
-            pos_args.append(val)
-
-        if pos_args:
-            tool_func = self.tool_registry.get_tool(tool_name)
-            if tool_func:
-                import inspect
-                sig = inspect.signature(tool_func)
-                params = list(sig.parameters.keys())
-                args_dict = {}
-                for idx, val in enumerate(pos_args):
-                    if idx < len(params):
-                        args_dict[params[idx]] = val
-                if args_dict:
-                    return tool_name, args_dict
-
-        return tool_name, {}
-
-
-    def _safe_api_call(self, messages, temperature=0.2, max_retries=10, initial_delay=5):
-        """Wraps the OpenAI API call in an exponential backoff loop to handle 429s automatically."""
-        delay = initial_delay
-        for attempt in range(max_retries):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature
-                )
-                return response
-            except (openai.RateLimitError, openai.APIConnectionError, openai.InternalServerError) as e:
-                if attempt == max_retries - 1:
-                    console.print(f"[bold red]❌ Exhausted API retries after {max_retries} attempts: {e}[/bold red]")
-                    raise
-                
-                # Check if the API specifically requested an 18s wait time
-                wait_time = delay
-                err_msg = str(e)
-                if "18s" in err_msg or "18." in err_msg:
-                    wait_time = max(wait_time, 20)
-                
-                console.print(f"[yellow]⏳ Transient API Error / Rate Limit Hit ({type(e).__name__}). Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})[/yellow]")
-                time.sleep(wait_time)
-                delay *= 1.5  # Exponential backoff
-            except Exception as e:
-                # Let other exceptions crash immediately
-                console.print(f"[bold red]❌ Unexpected API Error: {e}[/bold red]")
-                raise
+    def _build_system_prompt(self, base_prompt: str, agents_context: str) -> str:
+        """Appends the live tool descriptions and any repo-specific rules to a base prompt."""
+        prompt = base_prompt + "\n\nAVAILABLE TOOLS (live):\n" + self.tool_registry.get_all_tool_descriptions()
+        if agents_context:
+            prompt += agents_context
+        return prompt
 
     def _animate_diff(self, final_fix: str):
-        """Creates a beautiful typing effect for code changes in red and green."""
+        """Typing-effect display of the diff before it is applied."""
         console.print("\n[bold cyan]✨ APPLYING CHANGES...[/bold cyan]")
-        time.sleep(1) # Dramatic pause
+        time.sleep(1)
 
         diff_text = _extract_unified_diff(final_fix)
         if not diff_text:
@@ -283,127 +176,76 @@ class AgentOrchestrator:
 
         lines = diff_text.splitlines()
         num_lines = len(lines)
-        
-        # Calculate dynamic delay to avoid taking too long for larger diffs
-        del_add_remove = max(0.005, min(0.08, 4.0 / max(1, num_lines)))
-        del_context = max(0.001, min(0.02, 1.0 / max(1, num_lines)))
+        del_add_delay = max(0.005, min(0.08, 4.0 / max(1, num_lines)))
+        ctx_delay = max(0.001, min(0.02, 1.0 / max(1, num_lines)))
 
         for line in lines:
             if line.startswith("-") and not line.startswith("---"):
                 console.print(f"[bold red]{line}[/bold red]")
-                time.sleep(del_add_remove)  # Typing delay for removed code
+                time.sleep(del_add_delay)
             elif line.startswith("+") and not line.startswith("+++"):
                 console.print(f"[bold green]{line}[/bold green]")
-                time.sleep(del_add_remove)  # Typing delay for added code
+                time.sleep(del_add_delay)
             else:
                 console.print(f"[dim]{line}[/dim]")
-                time.sleep(del_context)  # Fast scroll for unchanged context
-        
+                time.sleep(ctx_delay)
+
         console.print("\n[bold green]✅ Code successfully updated![/bold green]")
-        time.sleep(2) # 2-second pause before validation
+        time.sleep(2)
 
-    # --- THE CORE ReAct LOOP (Claude Pattern) ---
-    def _run_agent_loop(self, messages: list, max_steps: int, stop_word: str):
-        """A generic ReAct loop that works for both Planner and Coder."""
-        for step in range(1, max_steps + 1):
-            
-            # Anti 413 Payload Too Large Logic for GitHub Models
-            # We keep system, original prompt, and a larger history limit for larger context models.
-            max_history = 40 if "gemini" in self.model else 10
-            if len(messages) > max_history:
-                messages[:] = messages[:2] + messages[-(max_history - 2):]
-                
-                
-            try:
-                response = self._safe_api_call(messages, temperature=0.2)
-            except Exception:
-                return None
-            
-            reply = response.choices[0].message.content
-            if reply is None:
-                console.print(f"[bold red]⚠️ Received empty/None content from model response.[/bold red]")
-                console.print(f"[dim]Response details: {response}[/dim]")
-                return None
-                
-            messages.append({"role": "assistant", "content": reply})
-
-            # Check if agent reached its goal (PLAN_COMPLETE or FINAL_FIX)
-            if stop_word in reply:
-                return reply.split(stop_word)[-1].strip()
-
-            # Check if the Planner rejected the issue
-            if "PLAN_REJECTED:" in reply:
-                return "PLAN_REJECTED:" + reply.split("PLAN_REJECTED:")[-1]
-
-            # Otherwise, check for tool usage
-            tool_name, tool_args = self.parse_tool_call(reply)
-            
-            if tool_name:
-                console.print(f"[dim]   ⚙️ Calling Tool: {tool_name} {tool_args}[/dim]")
-                
-                # Use Tool Registry for execution
-                tool_result = self.tool_registry.execute_tool(tool_name, tool_args)
-                
-                # Anti-Context-Window-Explosion logic
-                if len(tool_result) > 15000:
-                    tool_result = tool_result[:15000] + "\n... [TRUNCATED. The file is too large. Please use read_file with 'start_line' and 'end_line' parameters to read the required section.]"
-                
-                messages.append({"role": "user", "content": f"OBSERVATION:\n{tool_result}"})
-            else:
-                # Nudge if the LLM gets stuck
-                messages.append({"role": "user", "content": f"Please call a tool or output {stop_word}."})
-                
-        return None # Loop exhausted without success
+    # ------------------------------------------------------------------
+    # Stage 4 – PR summary
+    # ------------------------------------------------------------------
 
     def _generate_pr_summary(self, issue_description: str, final_fix: str) -> str:
         """Calls the PR Generator LLM to write a PR title and body."""
         console.print("\n[bold cyan]📝 STAGE 4: GENERATING PULL REQUEST SUMMARY...[/bold cyan]")
         time.sleep(1)
-        
+
         diff_text = _extract_unified_diff(final_fix)
         if not diff_text:
-            import subprocess
-            git_diff_proc = subprocess.run(["git", "diff"], cwd=self.repo_path, capture_output=True, text=True)
-            diff_text = git_diff_proc.stdout
-            if not diff_text:
-                diff_text = final_fix
+            git_diff_proc = subprocess.run(
+                ["git", "diff"], cwd=self.repo_path, capture_output=True, text=True
+            )
+            diff_text = git_diff_proc.stdout or final_fix
 
         messages = [
             {"role": "system", "content": self.pr_generator_sys_prompt},
-            {
-                "role": "user",
-                "content": f"Issue:\n{issue_description}\n\nCode Diff:\n{diff_text}"
-            }
+            {"role": "user", "content": f"Issue:\n{issue_description}\n\nCode Diff:\n{diff_text}"},
         ]
-        
+
         try:
-            response = self._safe_api_call(messages, temperature=0.3)
+            response = safe_api_call(self.client, self.model, messages, temperature=0.3)
             return response.choices[0].message.content
         except Exception:
-            return "Failed to generate PR summary due to an API Error."
+            return "Failed to generate PR summary due to an API error."
 
-    # --- THE MASTER FLOW ---
+    # ------------------------------------------------------------------
+    # Master pipeline
+    # ------------------------------------------------------------------
+
     def run(self, issue_description: str):
+        """Entry point – runs all four stages end-to-end."""
+
+        # --- Pre-compute ranked file context ---
         ranked_files = rank_relevant_files(self.repo_path, issue_description, limit=5)
         ranked_summary = format_ranked_files(ranked_files)
         ranked_context = read_ranked_files(self.repo_path, ranked_files, max_files=1)
 
-        # Truncate context heavily for initial prompt to prevent 413s on large repos
-        if len(ranked_context) > 15000:
-            ranked_context = ranked_context[:15000] + "\n...[TRUNCATED: File too large. Use read_file with start_line and end_line to read the rest.]"
+        if len(ranked_context) > MAX_CONTEXT:
+            ranked_context = (
+                ranked_context[:MAX_CONTEXT]
+                + "\n...[TRUNCATED: File too large. Use read_file with start_line and end_line to read the rest.]"
+            )
 
         agents_context = self._get_repo_agents_context()
 
-        # STAGE 1: PLANNER
+        # ---- STAGE 1: PLANNER ------------------------------------------------
         time.sleep(1)
         console.print("\n[bold cyan]🧠 STAGE 1: PLANNER IS INVESTIGATING...[/bold cyan]")
-        
-        dynamic_planner_prompt = self._inject_tools_into_prompt(self.planner_sys_prompt)
-        if agents_context:
-            dynamic_planner_prompt += agents_context
-        
+
         planner_messages = [
-            {"role": "system", "content": dynamic_planner_prompt},
+            {"role": "system", "content": self._build_system_prompt(self.planner_sys_prompt, agents_context)},
             {
                 "role": "user",
                 "content": (
@@ -414,28 +256,40 @@ class AgentOrchestrator:
                 ),
             },
         ]
-        
-        plan = self._run_agent_loop(planner_messages, max_steps=15, stop_word="PLAN_COMPLETE:")
-        
+
+        plan = run_agent_loop(
+            client=self.client,
+            model=self.model,
+            messages=planner_messages,
+            tool_registry=self.tool_registry,
+            max_steps=15,
+            stop_word="PLAN_COMPLETE:",
+        )
+
         if not plan:
-            console.print("[bold red]❌ Planner failed to create a plan within step limit or due to API errors.[/bold red]")
+            console.print(
+                "[bold red]❌ Planner failed to create a plan within step limit or due to API errors.[/bold red]"
+            )
             return
 
         if plan.startswith("PLAN_REJECTED:"):
             reason = plan.replace("PLAN_REJECTED:", "").strip()
-            console.print(Panel(f"[bold red]Issue Rejected:[/bold red] The issue is out of scope.\n\n[bold white]Reason:[/bold white]\n{reason}", title="Aborted", border_style="red"))
+            console.print(
+                Panel(
+                    f"[bold red]Issue Rejected:[/bold red] The issue is out of scope.\n\n"
+                    f"[bold white]Reason:[/bold white]\n{reason}",
+                    title="Aborted",
+                    border_style="red",
+                )
+            )
             return
 
         console.print(Panel(Markdown(plan), title="Action Plan", border_style="green"))
         time.sleep(1.5)
 
-        # STAGES 2 & 3: CODER + VALIDATION LOOP
-        dynamic_coder_prompt = self._inject_tools_into_prompt(self.coder_sys_prompt)
-        if agents_context:
-            dynamic_coder_prompt += agents_context
-        
+        # ---- STAGES 2 & 3: CODER + VALIDATION LOOP ---------------------------
         coder_messages = [
-            {"role": "system", "content": dynamic_coder_prompt},
+            {"role": "system", "content": self._build_system_prompt(self.coder_sys_prompt, agents_context)},
             {
                 "role": "user",
                 "content": (
@@ -452,49 +306,63 @@ class AgentOrchestrator:
         final_fix_to_use = None
 
         for attempt in range(1, MAX_RETRIES + 1):
-            console.print(f"\n[bold cyan]👨‍💻 STAGE 2: CODER IS WRITING FIX (Attempt {attempt}/{MAX_RETRIES})...[/bold cyan]")
-            
-            final_fix = self._run_agent_loop(coder_messages, max_steps=15, stop_word="FINAL_FIX:")
-            
+            console.print(
+                f"\n[bold cyan]👨‍💻 STAGE 2: CODER IS WRITING FIX (Attempt {attempt}/{MAX_RETRIES})...[/bold cyan]"
+            )
+
+            final_fix = run_agent_loop(
+                client=self.client,
+                model=self.model,
+                messages=coder_messages,
+                tool_registry=self.tool_registry,
+                max_steps=15,
+                stop_word="FINAL_FIX:",
+            )
+
             if not final_fix:
-                console.print("[bold red]❌ Coder failed to generate a fix within step limit or due to API errors.[/bold red]")
+                console.print(
+                    "[bold red]❌ Coder failed to generate a fix within step limit or due to API errors.[/bold red]"
+                )
                 break
 
-            # --- ANIMATED DIFF UI ---
+            # Animated diff display
             self._animate_diff(final_fix)
 
             console.print("\n[bold cyan]🧪 STAGE 3: VALIDATION STARTED...[/bold cyan]")
-            
+
             applied, apply_msg = apply_git_diff(self.repo_path, final_fix)
             if not applied:
                 console.print(f"[bold yellow]⚠️ Failed to apply diff:\n{apply_msg}[/bold yellow]")
                 console.print("[dim]Reverting changes and requesting a corrected diff...[/dim]")
                 revert_repo(self.repo_path)
                 coder_messages.append({
-                    "role": "user", 
-                    "content": f"Failed to apply git diff. Ensure your diff lines up exactly with the existing source code.\nError:\n{apply_msg}\nPlease try again and provide a corrected FINAL_FIX."
+                    "role": "user",
+                    "content": (
+                        f"Failed to apply git diff. Ensure your diff matches the source exactly.\n"
+                        f"Error:\n{apply_msg}\nPlease provide a corrected FINAL_FIX."
+                    ),
                 })
                 time.sleep(1)
                 continue
-                
+
             console.print("[green]✅ Diff applied successfully to local repository.[/green]")
             console.print("[dim]Running Syntax Check (Local) & Blast Radius Check (Global)...[/dim]")
-            
+
             modified_files = extract_modified_files(final_fix, self.repo_path)
             valid, val_msg, failing_context = run_go_validation(self.repo_path, modified_files)
-            
+
             if valid:
                 console.print("[bold green]✅ Validation successful! Code compiles and tests pass.[/bold green]")
-                # Show the final code diff
                 time.sleep(1)
                 console.print("\n[bold cyan]FINAL VALIDATED CODE INTEGRATED:[/bold cyan]")
-                
+
                 diff_to_print = _extract_unified_diff(final_fix)
                 if not diff_to_print:
-                    import subprocess
-                    git_diff_proc = subprocess.run(["git", "diff"], cwd=self.repo_path, capture_output=True, text=True)
+                    git_diff_proc = subprocess.run(
+                        ["git", "diff"], cwd=self.repo_path, capture_output=True, text=True
+                    )
                     diff_to_print = git_diff_proc.stdout
-                    
+
                 for line in diff_to_print.splitlines():
                     if line.startswith("+++") or line.startswith("---"):
                         console.print(f"[bold cyan]{line}[/bold cyan]")
@@ -504,32 +372,35 @@ class AgentOrchestrator:
                         console.print(f"[bold red]{line}[/bold red]")
                     else:
                         console.print(f"[dim]{line}[/dim]")
-                time.sleep(3) # Wait 3 seconds
-                
+
+                time.sleep(3)
                 final_fix_to_use = final_fix
                 break
+
             else:
-                console.print(f"[bold yellow]⚠️ Validation Failed. Reverting changes and re-prompting Coder...[/bold yellow]")
+                console.print(
+                    "[bold yellow]⚠️ Validation Failed. Reverting changes and re-prompting Coder...[/bold yellow]"
+                )
                 console.print(Panel(val_msg, border_style="yellow"))
                 revert_repo(self.repo_path)
-                
+
                 feedback = f"Validation failed after applying your diff:\n{val_msg}\n"
                 if failing_context:
                     if len(failing_context) > 3000:
                         failing_context = failing_context[:3000] + "\n...[TRUNCATED]"
-                    feedback += f"\nThis change broke other files. Here is the context of the broken files:\n{failing_context}\n"
+                    feedback += f"\nBroken file context:\n{failing_context}\n"
                 feedback += "Please analyze the error and provide a corrected FINAL_FIX."
-                
+
                 coder_messages.append({"role": "user", "content": feedback})
                 time.sleep(1)
-                
+
         if not final_fix_to_use:
-            console.print("[bold red]❌ Failed to generate a validated fix after multiple attempts.[/bold red]")
+            console.print(
+                "[bold red]❌ Failed to generate a validated fix after multiple attempts.[/bold red]"
+            )
             return
 
-        # STAGE 4: PR GENERATOR
+        # ---- STAGE 4: PR GENERATOR -------------------------------------------
         pr_summary = self._generate_pr_summary(issue_description, final_fix_to_use)
-        
-        # Display Final Outputs
         console.print("\n")
         console.print(Panel(Markdown(pr_summary), title="Pull Request Summary", border_style="magenta"))
