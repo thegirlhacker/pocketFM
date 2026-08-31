@@ -10,6 +10,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich import print as rprint
+from rich.syntax import Syntax
 
 from core.orchestrator import AgentOrchestrator
 
@@ -151,7 +152,16 @@ def main():
         )
         
         # Start the Autonomous Loop
-        agent.run(issue_description)
+        final_fix = agent.run(issue_description)
+        
+        if final_fix:
+            console.print(f"\n[bold green]🎉 SUCCESS! The fixed repository is located at:[/bold green] {local_repo_path}")
+            console.print("[dim]You can cd into it, review the changes, and push them.[/dim]")
+            console.print("\n[bold cyan]Diff Patch:[/bold cyan]")
+            syntax = Syntax(final_fix, "diff", theme="monokai", line_numbers=False)
+            console.print(syntax)
+            # Prevent cleanup
+            local_repo_was_cloned = False
         
     except KeyboardInterrupt:
         console.print("\n[bold yellow]🛑 Agent stopped manually by user (Ctrl+C).[/bold yellow]")

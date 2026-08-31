@@ -68,6 +68,10 @@ def get_go_binary(repo_path: str) -> str:
             pass
 
     system = platform.system().lower()
+    if system == "windows":
+        print("\n[bold red]❌ Go is not installed globally. Auto-download is unsupported on Windows. Please install Go manually.[/bold red]")
+        return ""
+        
     machine = platform.machine().lower()
     arch = "amd64" if machine in ["x86_64", "amd64"] else "arm64"
     if system not in ["linux", "darwin"]:

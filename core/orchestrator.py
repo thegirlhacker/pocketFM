@@ -11,18 +11,23 @@ from rich.markdown import Markdown
 
 from tools.search.grep_tool import grep_search
 from tools.search.tree_mapper import get_repo_structure
-from tools.editor.diff_applier import (
+from tools.git.git_utils import (
     apply_git_diff,
     revert_repo,
     extract_modified_files,
-    edit_file_tool,
     _extract_unified_diff,
 )
+from tools.editor.file_editor import (
+    edit_file_tool,
+    create_file_tool,
+    delete_file_tool,
+    replace_lines_tool,
+)
 from tools.editor.file_reader import (
-    find_relevant_files,
     read_file_with_line_numbers,
     read_function as _read_function,
 )
+from tools.search.relevance import find_relevant_files
 from tools.validator.go_tester import run_go_validation
 from core.file_utils import load_prompt, MAX_CONTEXT
 from tools.registry.tool_registry import ToolRegistry
@@ -105,11 +110,26 @@ class AgentOrchestrator:
             """
             return edit_file_tool(self.repo_path, filepath, old_snippet, new_snippet)
 
+        def create_file(filepath: str, content: str) -> str:
+            """Creates a new file with the given content."""
+            return create_file_tool(self.repo_path, filepath, content)
+
+        def delete_file(filepath: str) -> str:
+            """Deletes the specified file."""
+            return delete_file_tool(self.repo_path, filepath)
+
+        def replace_lines(filepath: str, start_line: int, end_line: int, new_content: str) -> str:
+            """Replaces lines from start_line to end_line (inclusive) with new_content."""
+            return replace_lines_tool(self.repo_path, filepath, start_line, end_line, new_content)
+
         self.tool_registry.register("grep", grep)
         self.tool_registry.register("tree", tree)
         self.tool_registry.register("read_file", read_file)
         self.tool_registry.register("read_function", read_function)
         self.tool_registry.register("edit_file", edit_file)
+        self.tool_registry.register("create_file", create_file)
+        self.tool_registry.register("delete_file", delete_file)
+        self.tool_registry.register("replace_lines", replace_lines)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -119,25 +139,12 @@ class AgentOrchestrator:
         self, filepath: str, start_line: int = None, end_line: int = None
     ) -> str:
         """Read a Go file, optionally limiting to a line range."""
-        content = read_file_with_line_numbers(self.repo_path, filepath)
-        if content.startswith("Error"):
-            return content
-        if start_line is not None or end_line is not None:
-            lines = content.splitlines()
-            start_idx = 0
-            end_idx = len(lines)
-            if start_line is not None:
-                try:
-                    start_idx = max(0, int(start_line) - 1)
-                except (ValueError, TypeError):
-                    pass
-            if end_line is not None:
-                try:
-                    end_idx = min(len(lines), int(end_line))
-                except (ValueError, TypeError):
-                    pass
-            return "\n".join(lines[start_idx:end_idx])
-        return content
+        try:
+            start = int(start_line) if start_line is not None else None
+            end = int(end_line) if end_line is not None else None
+        except (ValueError, TypeError):
+            return "Error: start_line and end_line must be integers."
+        return read_file_with_line_numbers(self.repo_path, filepath, start, end)
 
     def _get_repo_agents_context(self) -> str:
         """Looks for AGENTS.md / .github/AGENTS.md / RULES.md and injects project-specific rules."""
@@ -273,7 +280,7 @@ class AgentOrchestrator:
             console.print(
                 "[bold red]❌ Planner failed to create a plan within step limit or due to API errors.[/bold red]"
             )
-            return
+            return None
 
         if plan.startswith("PLAN_REJECTED:"):
             reason = plan.replace("PLAN_REJECTED:", "").strip()
@@ -285,7 +292,7 @@ class AgentOrchestrator:
                     border_style="red",
                 )
             )
-            return
+            return None
 
         console.print(Panel(Markdown(plan), title="Action Plan", border_style="green"))
         time.sleep(1.5)
@@ -379,9 +386,11 @@ class AgentOrchestrator:
             console.print(
                 "[bold red]❌ Failed to generate a validated fix after multiple attempts.[/bold red]"
             )
-            return
+            return None
 
         # ---- STAGE 4: PR GENERATOR -------------------------------------------
         pr_summary = self._generate_pr_summary(issue_description, final_fix_to_use)
         console.print("\n")
         console.print(Panel(Markdown(pr_summary), title="Pull Request Summary", border_style="magenta"))
+        
+        return final_fix_to_use
